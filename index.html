@@ -1146,13 +1146,33 @@ function tplCircles(){
     <div class="tabs-inline">
       ${CIRCLE_TRACKS.map(t=>`<button data-action="circle-track-tab" data-track="${esc(t)}" class="${activeTrack===t?'active':''}">${esc(t)} (${DB.config.circles.filter(c=>(c.track||CIRCLE_TRACKS[0])===t).length})</button>`).join('')}
     </div>
+    <div class="filter-bar">
+      <div class="field mb0"><input type="text" id="circleSearchInput" value="${esc(uiState.circleSearch||'')}" placeholder="ابحث باسم المقرئ أو رقم الحلقة..."></div>
+      <div class="field mb0">
+        <select data-filter="circlePeriod">
+          <option value="">كل الفترات</option>
+          ${PRAYER_PERIODS.map(p=>`<option value="${p.id}" ${uiState.circlePeriodFilter===p.id?'selected':''}>${esc(p.name)}</option>`).join('')}
+        </select>
+      </div>
+    </div>
     ${renderCirclesOfTrack(activeTrack)}
   </div>`;
 }
 
 function renderCirclesOfTrack(track){
-  const list = DB.config.circles.filter(c=>(c.track||CIRCLE_TRACKS[0])===track);
-  if(!list.length) return emptyState('لا توجد حلقات في هذا المسار بعد','أنشئ حلقة جديدة واختر لها هذا المسار من النموذج أعلاه.');
+  let list = DB.config.circles.filter(c=>(c.track||CIRCLE_TRACKS[0])===track);
+  const q = (uiState.circleSearch||'').trim().toLowerCase();
+  if(q){
+    list = list.filter(c=>{
+      const r = getReciter(c.reciterId);
+      return (r?.name||'').toLowerCase().includes(q) || (c.number||'').toLowerCase().includes(q);
+    });
+  }
+  const periodFilter = uiState.circlePeriodFilter;
+  if(periodFilter){
+    list = list.filter(c=>(c.periodIds||[]).includes(periodFilter));
+  }
+  if(!list.length) return emptyState('لا توجد حلقات مطابقة','جرّب تعديل البحث أو الفلتر أعلاه، أو أنشئ حلقة جديدة بهذا المسار من النموذج أعلاه.');
   return `<table><thead><tr><th>رقم الحلقة</th><th>اسم الحلقة</th><th>المقرئ</th><th>الفترات</th><th>عدد الطلاب</th><th></th></tr></thead><tbody>
     ${list.map(c=>{
       const r = getReciter(c.reciterId);
@@ -1204,6 +1224,12 @@ function tplStudents(){
           </select>
         </div>
       </div>
+      <div class="field"><label>الفترة</label>
+        <select name="periodId">
+          <option value="">— بدون —</option>
+          ${PRAYER_PERIODS.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('')}
+        </select>
+      </div>
       <button class="btn btn-primary" type="submit">إضافة الطالب</button>
     </form>`}
   </div>
@@ -1249,12 +1275,14 @@ function renderStudentCard(s, circles){
       ` : `<button class="btn btn-ghost btn-sm" style="margin-bottom:12px;" data-action="start-edit-student-info" data-id="${s.id}">تعديل رقم التسجيل / الجنسية</button>`}
 
       ${!enrollments.length ? emptyState('غير مسجّل في أي حلقة حاليًا','') : `
-      <table><thead><tr><th>الحلقة</th><th>المستوى</th><th>أين وصل</th><th>القراءة</th><th>أيام الغياب</th><th></th></tr></thead><tbody>
+      <table><thead><tr><th>الحلقة</th><th>الفترة</th><th>المستوى</th><th>أين وصل</th><th>القراءة</th><th>أيام الغياب</th><th></th></tr></thead><tbody>
         ${enrollments.map(en=>{
           const c = getCircle(en.circleId);
+          const pe = en.periodId ? getPeriod(en.periodId) : null;
           const abs = absenceDaysCount(s.id, en.circleId);
           return `<tr>
             <td><b>${esc(c?circleLabel(c):'—')}</b></td>
+            <td class="muted">${esc(pe?.name||'—')}</td>
             <td class="muted">${esc(en.level||'—')}</td>
             <td class="muted">${esc(en.progress||'—')}</td>
             <td class="muted">${esc(en.qiraah||'—')}</td>
@@ -1272,6 +1300,9 @@ function renderStudentCard(s, circles){
               <option value="">— اختر —</option>
               ${availableCircles.map(c=>`<option value="${c.id}">${esc(circleLabel(c))}</option>`).join('')}
             </select>
+          </div>
+          <div class="field mb0"><label>الفترة</label>
+            <select name="periodId"><option value="">—</option>${PRAYER_PERIODS.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select>
           </div>
           <div class="field mb0"><label>المستوى</label><input type="text" name="level"></div>
           <div class="field mb0"><label>أين وصل</label><input type="text" name="progress"></div>
@@ -1346,7 +1377,7 @@ function buildTemplateWorkbook(){
   const wb = XLSX.utils.book_new();
   const wsR = XLSX.utils.aoa_to_sheet([['الاسم','اسم المستخدم','البريد الإلكتروني','كلمة المرور'],['مثال: محمد العتيبي','mohammed','mohammed@example.com','1234']]);
   const wsC = XLSX.utils.aoa_to_sheet([['رقم الحلقة','اسم الحلقة','بريد المقرئ','المسار','الفترات'],['12','حلقة التحفيظ الأولى','mohammed@example.com','مباشر','الفجر،العصر']]);
-  const wsS = XLSX.utils.aoa_to_sheet([['اسم الطالب','رقم التسجيل','الجنسية','رقم الحلقة','المستوى','أين وصل','القراءة'],['مثال: عبدالله أحمد','10023','سعودي','12','حافظ 5 أجزاء','سورة الكهف','حفص عن عاصم']]);
+  const wsS = XLSX.utils.aoa_to_sheet([['اسم الطالب','رقم التسجيل','الجنسية','رقم الحلقة','الفترة','المستوى','أين وصل','القراءة'],['مثال: عبدالله أحمد','10023','سعودي','12','العصر','حافظ 5 أجزاء','سورة الكهف','حفص عن عاصم']]);
   XLSX.utils.book_append_sheet(wb, wsR, 'المقرئون');
   XLSX.utils.book_append_sheet(wb, wsC, 'الحلقات');
   XLSX.utils.book_append_sheet(wb, wsS, 'الطلاب');
@@ -1419,19 +1450,22 @@ async function processImportFile(file){
     const regNumber = (row[1]||'').toString().trim();
     const nationality = (row[2]||'').toString().trim();
     const circleNumber = (row[3]||'').toString().trim();
-    const level = (row[4]||'').toString().trim();
-    const progress = (row[5]||'').toString().trim();
-    const qiraah = (row[6]||'').toString().trim();
+    const periodName = (row[4]||'').toString().trim();
+    const level = (row[5]||'').toString().trim();
+    const progress = (row[6]||'').toString().trim();
+    const qiraah = (row[7]||'').toString().trim();
     if(!name || !circleNumber){ errors.push(`الطلاب، صف ${i+2}: بيانات ناقصة، تم التجاهل.`); return; }
     const circle = DB.config.circles.find(c=>c.number===circleNumber);
     if(!circle){ errors.push(`الطلاب، صف ${i+2}: لم يتم إيجاد حلقة برقم "${circleNumber}"، تم التجاهل.`); return; }
+    const periodId = periodName ? findPeriodIdByName(periodName) : null;
+    if(periodName && !periodId){ errors.push(`الطلاب، صف ${i+2}: لم يتم التعرف على الفترة "${periodName}".`); }
     let student = regNumber ? DB.config.students.find(s=>s.regNumber===regNumber) : null;
     if(student){
       if(!student.enrollments.some(en=>en.circleId===circle.id)){
-        student.enrollments.push({circleId:circle.id, level, progress, qiraah});
+        student.enrollments.push({circleId:circle.id, level, progress, qiraah, periodId});
       }
     }else{
-      DB.config.students.push({id:uid(), name, regNumber, nationality, enrollments:[{circleId:circle.id, level, progress, qiraah}]});
+      DB.config.students.push({id:uid(), name, regNumber, nationality, enrollments:[{circleId:circle.id, level, progress, qiraah, periodId}]});
     }
     addedStudents++;
   });
@@ -1658,11 +1692,12 @@ function tplMyCircles(){
       <div class="panel-head"><h3>${esc(circleLabel(c))}</h3><span class="count-badge">${students.length} طالب</span></div>
       <div class="hint" style="margin:0 0 12px;">المسار: ${esc(c.track||CIRCLE_TRACKS[0])} — الفترات: ${esc(circlePeriodsLabel(c))}</div>
       ${!students.length ? emptyState('لا يوجد طلاب في هذه الحلقة بعد','يقوم المشرف بإضافة الطلاب لحلقتك.') : `
-      <table><thead><tr><th>الاسم</th><th>رقم التسجيل</th><th>الجنسية</th><th>المستوى</th><th>أين وصل</th><th>القراءة</th><th>أيام الغياب</th></tr></thead><tbody>
+      <table><thead><tr><th>الاسم</th><th>رقم التسجيل</th><th>الجنسية</th><th>الفترة</th><th>المستوى</th><th>أين وصل</th><th>القراءة</th><th>أيام الغياب</th></tr></thead><tbody>
         ${students.map(s=>{
           const en = enrollmentOf(s, c.id) || {};
+          const pe = en.periodId ? getPeriod(en.periodId) : null;
           const abs = absenceDaysCount(s.id, c.id);
-          return `<tr><td><b>${esc(s.name)}</b></td><td class="muted">${esc(s.regNumber||'—')}</td><td class="muted">${esc(s.nationality||'—')}</td><td class="muted">${esc(en.level||'—')}</td><td class="muted">${esc(en.progress||'—')}</td><td class="muted">${esc(en.qiraah||'—')}</td><td>${abs>0?`<span class="tag tag-red">${abs}</span>`:'0'}</td></tr>`;
+          return `<tr><td><b>${esc(s.name)}</b></td><td class="muted">${esc(s.regNumber||'—')}</td><td class="muted">${esc(s.nationality||'—')}</td><td class="muted">${esc(pe?.name||'—')}</td><td class="muted">${esc(en.level||'—')}</td><td class="muted">${esc(en.progress||'—')}</td><td class="muted">${esc(en.qiraah||'—')}</td><td>${abs>0?`<span class="tag tag-red">${abs}</span>`:'0'}</td></tr>`;
         }).join('')}
       </tbody></table>`}
     </div>`;
@@ -1992,6 +2027,9 @@ function bindContentEvents(){
   content.addEventListener('change', (e)=>{
     const filt = e.target.closest('[data-filter]');
     if(filt){
+      if(filt.dataset.filter==='circlePeriod'){
+        uiState.circlePeriodFilter = filt.value; render(); return;
+      }
       uiState.trackFilter = uiState.trackFilter || {};
       uiState.trackFilter[filt.dataset.filter] = filt.value;
       render(); return;
@@ -2023,6 +2061,15 @@ function bindContentEvents(){
       const cursorPos = searchInput.selectionStart;
       render();
       const newInput = document.getElementById('studentSearchInput');
+      if(newInput){ newInput.focus(); newInput.setSelectionRange(cursorPos, cursorPos); }
+      return;
+    }
+    const circleSearchInput = e.target.closest('#circleSearchInput');
+    if(circleSearchInput){
+      uiState.circleSearch = circleSearchInput.value;
+      const cursorPos = circleSearchInput.selectionStart;
+      render();
+      const newInput = document.getElementById('circleSearchInput');
       if(newInput){ newInput.focus(); newInput.setSelectionRange(cursorPos, cursorPos); }
     }
   });
@@ -2084,8 +2131,9 @@ function bindContentEvents(){
       const level=(fd.get('level')||'').toString().trim();
       const progress=(fd.get('progress')||'').toString().trim();
       const qiraah=(fd.get('qiraah')||'').toString().trim();
+      const periodId=(fd.get('periodId')||'').toString().trim();
       if(!name||!circleId) return;
-      DB.config.students.push({id:uid(), name, regNumber, nationality, enrollments:[{circleId, level, progress, qiraah}]});
+      DB.config.students.push({id:uid(), name, regNumber, nationality, enrollments:[{circleId, level, progress, qiraah, periodId}]});
       await saveConfig(); showToast('تمت إضافة الطالب'); render();
     }
     if(type==='edit-student-info'){
@@ -2102,11 +2150,12 @@ function bindContentEvents(){
       const level=(fd.get('level')||'').toString().trim();
       const progress=(fd.get('progress')||'').toString().trim();
       const qiraah=(fd.get('qiraah')||'').toString().trim();
+      const periodId=(fd.get('periodId')||'').toString().trim();
       if(!studentId||!circleId) return;
       const s = getStudent(studentId);
       if(s){
         s.enrollments = s.enrollments||[];
-        if(!s.enrollments.some(en=>en.circleId===circleId)) s.enrollments.push({circleId, level, progress, qiraah});
+        if(!s.enrollments.some(en=>en.circleId===circleId)) s.enrollments.push({circleId, level, progress, qiraah, periodId});
         await saveConfig(); showToast('تمت إضافة الطالب للحلقة'); 
       }
       uiState.enrollingStudent = null; render();
