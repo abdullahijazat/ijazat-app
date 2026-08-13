@@ -505,25 +505,49 @@ function resolveApiConfig(){
 // حدّ خلية واحدة في Google Sheets هو 50,000 حرف. لتفادي الاصطدام بهذا الحد كلما كبرت
 // البيانات (مثل عدد كبير من الطلاب)، نُقسّم أي قيمة كبيرة تلقائيًا على عدة "خلايا" (مفاتيح)
 // ونعيد تجميعها عند القراءة — بدل تخزينها كلها في خلية واحدة محدودة السعة.
-const CHUNK_SIZE = 40000; // هامش أمان تحت حد الـ50,000
+const CHUNK_SIZE = 40000; // هامش أمان تحت حد الـ50,000 (لا قيد عليه هنا لأنه يُرسل داخل POST وليس رابطًا)
+
+// Apps Script (ContentService) لا يملك طريقة مدعومة لإرسال رؤوس CORS، لذلك أي "fetch" عادي
+// لقراءة البيانات من نطاق مختلف (مثل GitHub Pages) يُحجب من المتصفح. الحل الرسمي المعتمد من
+// جوجل نفسها لهذه الحالة: تقنية JSONP (تحميل الرابط كـ"سكربت" بدل طلب Fetch)، وهي لا تخضع
+// لقيود CORS إطلاقًا لأنها ببساطة عنصر <script> عادي كأي مكتبة خارجية.
+function jsonp_(url){
+  return new Promise((resolve, reject)=>{
+    const cbName = '_jsonp_cb_' + Date.now().toString(36) + Math.random().toString(36).slice(2);
+    const script = document.createElement('script');
+    let settled = false;
+    const cleanup = ()=>{ try{ delete window[cbName]; }catch(e){} if(script.parentNode) script.parentNode.removeChild(script); };
+    window[cbName] = (data)=>{ if(settled) return; settled=true; cleanup(); resolve(data); };
+    script.onerror = ()=>{ if(settled) return; settled=true; cleanup(); reject(new Error('jsonp_network_error')); };
+    script.src = url + (url.indexOf('?')>-1?'&':'?') + 'callback=' + cbName;
+    document.body.appendChild(script);
+    setTimeout(()=>{ if(settled) return; settled=true; cleanup(); reject(new Error('jsonp_timeout')); }, 20000);
+  });
+}
 
 async function apiGetRaw_(key){
   const u = `${API.url}?action=get&key=${encodeURIComponent(key)}${API.token?('&token='+encodeURIComponent(API.token)):''}`;
-  const res = await fetch(u);
-  if(!res.ok) return undefined;
-  const data = await res.json();
-  if(data.error) return undefined;
+  const data = await jsonp_(u);
+  if(!data || data.error) return undefined;
   return (data.value!==undefined && data.value!==null) ? data.value : undefined;
 }
+// الكتابة تبقى عبر POST عادي (لا قيد طول رابط)، لكن دون قراءة الاستجابة مباشرة (Fetch عبر
+// وضع no-cors يرسل الطلب وينفّذه Apps Script فعليًا، لكن لا يسمح المتصفح بقراءة ردّه لنفس
+// سبب CORS أعلاه) — لذلك نتحقق من نجاح الحفظ فعليًا عبر قراءة تأكيدية خفيفة (JSONP) بعدها.
 async function apiSetRaw_(key, rawString){
-  const res = await fetch(API.url, {
-    method:'POST',
-    headers:{'Content-Type':'text/plain;charset=utf-8'},
-    body: JSON.stringify({ action:'set', key, value: rawString, token: API.token })
-  });
-  if(!res.ok) return false;
-  const data = await res.json();
-  return !!data.ok;
+  try{
+    await fetch(API.url, {
+      method:'POST',
+      mode:'no-cors',
+      headers:{'Content-Type':'text/plain;charset=utf-8'},
+      body: JSON.stringify({ action:'set', key, value: rawString, token: API.token })
+    });
+  }catch(e){ return false; }
+  // تحقّق فعلي أن الكتابة وصلت وتمّت (وليس مجرد افتراض نجاح لعدم وجود خطأ شبكة)
+  try{
+    const check = await apiGetRaw_(key);
+    return check===rawString;
+  }catch(e){ return false; }
 }
 
 async function apiGet(key){
@@ -562,41 +586,9 @@ async function apiSet(key, value){
 async function apiTest(){
   try{
     const u = `${API.url}?action=get&key=__ping__${API.token?('&token='+encodeURIComponent(API.token)):''}`;
-    const res = await fetch(u);
-    const data = await res.json();
-    return !data.error;
+    const data = await jsonp_(u);
+    return !!data && !data.error;
   }catch(e){ return false; }
-}
-
-// يجلب كل البيانات (config/plans/attendance/harvest/examinations) بطلب واحد، مع إعادة تجميع
-// أي مفتاح مُجزّأ تلقائيًا (انظر آلية التجزئة أعلاه)
-async function apiGetAll(){
-  try{
-    const u = `${API.url}?action=getAll${API.token?('&token='+encodeURIComponent(API.token)):''}`;
-    const res = await fetch(u);
-    if(!res.ok) return null;
-    const data = await res.json();
-    if(!data.ok) return null;
-    const raw = data.data || {};
-    const out = {};
-    for(const k of ['config','plans','attendance','harvest','examinations']){
-      const chunkCount = raw[k+'__chunks']? parseInt(raw[k+'__chunks'],10): 0;
-      let json;
-      if(chunkCount>0){
-        const parts = [];
-        for(let i=0;i<chunkCount;i++){
-          const part = raw[`${k}__chunk_${i}`];
-          if(part===undefined){ json=undefined; break; }
-          parts.push(part);
-        }
-        json = parts.length===chunkCount ? parts.join('') : undefined;
-      }else{
-        json = raw[k];
-      }
-      out[k] = (json!==undefined && json!==null && json!=='') ? JSON.parse(json) : null;
-    }
-    return out;
-  }catch(e){ return null; }
 }
 
 function showToast(msg){
@@ -1182,7 +1174,13 @@ function tplReciters(){
     </form>
   </div>
   <div class="panel">
-    <div class="panel-head"><h3>قائمة المقرئين</h3><span class="count-badge">${list.length}</span></div>
+    <div class="panel-head">
+      <h3>قائمة المقرئين</h3>
+      <div class="flex items-center gap8">
+        <span class="count-badge">${list.length}</span>
+        ${list.length ? `<button class="btn btn-danger btn-sm" data-action="del-all-reciters">${uiState.confirmId==='all-reciters'?'تأكيد حذف الجميع؟':'حذف جميع المقرئين'}</button>` : ''}
+      </div>
+    </div>
     ${!list.length ? emptyState('لا يوجد مقرئون بعد','أضف أول مقرئ من النموذج أعلاه ليتمكن من الدخول للنظام.') : `
     <table><thead><tr><th>الاسم</th><th>اسم المستخدم</th><th>البريد الإلكتروني</th><th>عدد الحلقات</th><th>عدد الطلاب</th><th>مختبر؟</th><th></th></tr></thead><tbody>
       ${list.map(r=>{
@@ -2379,6 +2377,14 @@ function bindContentEvents(){
           DB.config.circles = DB.config.circles.filter(c=>c.reciterId!==id);
           DB.config.students.forEach(s=>{ s.enrollments = (s.enrollments||[]).filter(en=>!circleIds.includes(en.circleId)); });
           await saveConfig(); showToast('تم حذف المقرئ'); render();
+        });
+      }
+      if(action==='del-all-reciters'){
+        pendingConfirm('all-reciters', async ()=>{
+          DB.config.reciters = [];
+          DB.config.circles = [];
+          DB.config.students.forEach(s=>{ s.enrollments = []; });
+          await saveConfig(); showToast('تم حذف جميع المقرئين (وما يتبعها من حلقات وتسجيلات الطلاب)'); render();
         });
       }
       if(action==='del-circle'){
