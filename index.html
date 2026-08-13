@@ -532,10 +532,12 @@ function jsonp_(url){
     setTimeout(()=>{ finish(()=>reject(new Error('jsonp_timeout'))); }, 20000);
   });
 }
-// نفس jsonp_ لكن بمحاولة إضافية تلقائية عند أي فشل عابر (شبكة بطيئة، تعارض توقيت نادر...)
+// نفس jsonp_ لكن بمحاولتين إضافيتين تلقائيًا عند أي فشل عابر (شبكة بطيئة، تعارض توقيت نادر...)
 async function jsonpRetry_(url){
-  try{ return await jsonp_(url); }
-  catch(e){ return await jsonp_(url); }
+  for(let attempt=0; attempt<3; attempt++){
+    try{ return await jsonp_(url); }
+    catch(e){ if(attempt===2) throw e; }
+  }
 }
 
 async function apiGetRaw_(key){
@@ -563,40 +565,56 @@ async function apiSetRaw_(key, rawString){
   }catch(e){ return false; }
 }
 
+// نظام تخزين "ذرّي": كل عملية حفظ تكتب نسخة جديدة كاملة تحت مفاتيح جديدة تمامًا (لا تُكتب فوق
+// القديمة أبدًا)، ولا يتم "تحويل" القراء للنسخة الجديدة إلا بخطوة أخيرة واحدة بعد نجاح كل شيء
+// 100%. هذا يضمن أن أي قارئ يرى دائمًا إما النسخة القديمة كاملة أو الجديدة كاملة — لا يمكن أبدًا
+// أن يرى مزيجًا فاسدًا من الاثنين، حتى لو تعطّل الحفظ في منتصفه تمامًا (سبب حقيقي شوهد سابقًا).
+function randVersion_(){
+  return Date.now().toString(36) + Math.random().toString(36).slice(2,8);
+}
+
 async function apiGet(key){
   try{
-    const chunksRaw = await apiGetRaw_(key+'__chunks');
-    const chunkCount = chunksRaw? parseInt(chunksRaw,10): 0;
-    let json;
-    if(chunkCount>0){
-      const parts = await Promise.all(Array.from({length:chunkCount}, (_,i)=>apiGetRaw_(`${key}__chunk_${i}`)));
-      if(parts.some(p=>p===undefined)) return null;
-      json = parts.join('');
-    }else{
-      const raw = await apiGetRaw_(key);
-      if(raw===undefined || raw==='') return null;
-      json = raw;
+    const version = await apiGetRaw_(`${key}__current_version`);
+    if(version){
+      const chunksRaw = await apiGetRaw_(`${key}__v${version}__chunks`);
+      const chunkCount = chunksRaw? parseInt(chunksRaw,10): 0;
+      if(chunkCount>0){
+        const parts = await Promise.all(Array.from({length:chunkCount}, (_,i)=>apiGetRaw_(`${key}__v${version}__chunk_${i}`)));
+        if(parts.some(p=>p===undefined)) return null;
+        return JSON.parse(parts.join(''));
+      }
+      return null;
     }
-    return JSON.parse(json);
+    // توافق مع بيانات قديمة أُنشئت قبل هذا التحديث (نظام التجزئة السابق بدون إصدارات)
+    const legacyChunksRaw = await apiGetRaw_(key+'__chunks');
+    const legacyChunkCount = legacyChunksRaw? parseInt(legacyChunksRaw,10): 0;
+    if(legacyChunkCount>0){
+      const parts = await Promise.all(Array.from({length:legacyChunkCount}, (_,i)=>apiGetRaw_(`${key}__chunk_${i}`)));
+      if(parts.some(p=>p===undefined)) return null;
+      return JSON.parse(parts.join(''));
+    }
+    const raw = await apiGetRaw_(key);
+    if(raw===undefined || raw==='') return null;
+    return JSON.parse(raw);
   }catch(e){ return null; }
 }
 async function apiSet(key, value){
   try{
     const json = JSON.stringify(value);
-    if(json.length <= CHUNK_SIZE){
-      const ok = await apiSetRaw_(key, json);
-      if(ok) await apiSetRaw_(key+'__chunks', '0'); // 0 = غير مجزّأة، خلية واحدة كافية
-      return ok;
-    }
+    const version = randVersion_();
     const parts = [];
     for(let i=0;i<json.length;i+=CHUNK_SIZE) parts.push(json.slice(i,i+CHUNK_SIZE));
-    // نكتب الأجزاء بالتسلسل (وليس بالتوازي) — الكتابة المتزامنة الكثيفة على نفس جدول Google Sheets
-    // قد تتعارض وتُفقِد أجزاءً من البيانات (سبب حقيقي شوهد فعليًا)، فنُضحّي ببعض السرعة لضمان السلامة.
+    if(!parts.length) parts.push('');
+    // 1) نكتب كل الأجزاء الجديدة أولًا تحت مفاتيح جديدة كليًا — لا تؤثر على ما يقرأه أي شخص الآن
     for(let i=0;i<parts.length;i++){
-      const ok = await apiSetRaw_(`${key}__chunk_${i}`, parts[i]);
-      if(!ok) return false;
+      const ok = await apiSetRaw_(`${key}__v${version}__chunk_${i}`, parts[i]);
+      if(!ok) return false; // فشل هنا = لا ضرر، النسخة القديمة تبقى "الحقيقة" كما هي
     }
-    return await apiSetRaw_(key+'__chunks', String(parts.length));
+    const okCount = await apiSetRaw_(`${key}__v${version}__chunks`, String(parts.length));
+    if(!okCount) return false;
+    // 2) نقطة التحويل الذرّية الوحيدة: بمجرد نجاح هذا السطر فقط، يرى كل قارئ جديد النسخة الجديدة كاملة
+    return await apiSetRaw_(`${key}__current_version`, version);
   }catch(e){ return false; }
 }
 async function apiTest(){
@@ -634,15 +652,19 @@ async function init(){
 
   // المرحلة الحرجة (تحجب الظهور): نجلب فقط ما يلزم لعرض شاشة الدخول — الحسابات (config).
   // بقية البيانات (الخطط/التحضير/الحصاد/الاختبارات) تُحمَّل بعدها في الخلفية دون تعطيل الظهور.
-  let config = await apiGet('config');
+  let config = null;
+  for(let attempt=0; attempt<3 && config===null; attempt++){
+    config = await apiGet('config');
+  }
   if(config===null){
     const ok = await apiTest();
     if(!ok){ apiConnectionError = true; ready = true; render(); return; }
-    config = await apiGet('config'); // فشل أول مرة رغم نجاح ping، أعد المحاولة مرة واحدة
+    config = await apiGet('config'); // نجح ping لكن فشلت قراءة config، حاول أخيرة
   }
+  if(config===null){ apiConnectionError = true; ready = true; render(); return; }
   apiConnectionError = false;
 
-  DB.config = config || { reciters:[], circles:[], students:[], qiraahOptions:[...DEFAULT_QIRAAH_OPTIONS], planTypes:[...DEFAULT_PLAN_TYPES], supervisors:[] };
+  DB.config = config;
   if(!DB.config.qiraahOptions || !DB.config.qiraahOptions.length) DB.config.qiraahOptions = [...DEFAULT_QIRAAH_OPTIONS];
   if(!DB.config.planTypes || !DB.config.planTypes.length) DB.config.planTypes = [...DEFAULT_PLAN_TYPES];
   if(!DB.config.supervisors) DB.config.supervisors = [];
@@ -661,16 +683,25 @@ async function init(){
   currentTab = session ? (session.role==='supervisor' ? 'overview' : 'my-circles') : null;
   render(); // ← البرنامج يظهر الآن (شاشة الدخول أو لوحة التحكم)، بدون انتظار بقية البيانات
 
-  // المرحلة الثانية (خلفية): تكتمل غالبًا أثناء كتابة المستخدم لبيانات الدخول
-  const [plans, attendance, harvest, examinations] = await Promise.all([
-    apiGet('plans'), apiGet('attendance'), apiGet('harvest'), apiGet('examinations')
-  ]);
-  DB.plans = plans || [];
-  DB.attendance = attendance || [];
-  DB.harvest = harvest || [];
-  DB.examinations = examinations || [];
-  dataFullyLoaded = true;
-  if(session) render(); // إن كان قد دخل بالفعل، حدّث الشاشة الآن بالبيانات الكاملة
+  // المرحلة الثانية (خلفية): تكتمل غالبًا أثناء كتابة المستخدم لبيانات الدخول.
+  // مُغلَّفة بالكامل بمعالجة أخطاء صريحة حتى لا تبقى رسالة "جاري التحميل" عالقة للأبد لو فشل شيء.
+  try{
+    const [plans, attendance, harvest, examinations] = await Promise.all([
+      apiGet('plans'), apiGet('attendance'), apiGet('harvest'), apiGet('examinations')
+    ]);
+    DB.plans = plans || [];
+    DB.attendance = attendance || [];
+    DB.harvest = harvest || [];
+    DB.examinations = examinations || [];
+  }catch(e){
+    // لا نترك المستخدم عالقًا برسالة "جاري التحميل" للأبد — نكمل ببيانات فارغة ونُنبّه بلطف
+    DB.plans = DB.plans || []; DB.attendance = DB.attendance || [];
+    DB.harvest = DB.harvest || []; DB.examinations = DB.examinations || [];
+    if(session) showToast('تعذّر تحميل بعض البيانات (الخطط/التحضير...) — حاول تحديث الصفحة');
+  }finally{
+    dataFullyLoaded = true;
+    if(session) render(); // إن كان قد دخل بالفعل، حدّث الشاشة الآن (سواء نجحت البيانات أو فشلت)
+  }
 }
 
 /* ---------------- lookups ---------------- */
