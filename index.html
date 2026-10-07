@@ -320,7 +320,17 @@ textarea{min-height:80px; resize:vertical;}
 </div>
 <div class="toast" id="toast"></div>
 
-<script>
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-app.js";
+import {
+  getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword,
+  signOut as fbSignOut, updatePassword as fbUpdatePassword,
+  reauthenticateWithCredential, EmailAuthProvider, onAuthStateChanged
+} from "https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js";
+import {
+  getFirestore, collection, doc, getDoc, getDocs, setDoc, deleteDoc, writeBatch
+} from "https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js";
+
 /* =======================================================================
    شعبة إجازات القرآن الكريم — تطبيق إدارة الحلقات والخطط والتحضير والحصاد
    ======================================================================= */
@@ -414,225 +424,62 @@ function todayStr(){ const d=new Date(); return d.toISOString().slice(0,10); }
 function esc(s){ return (s??'').toString().replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
 
-/* ---------------- password hashing (client-side) ---------------- */
-// نستخدم SHA-256 عبر Web Crypto عند توفرها (يتطلب فتح الملف عبر https أو من مضيف محلي آمن).
-// عند تعذّر ذلك (مثل فتح الملف مباشرة بصيغة file:// في بعض المتصفحات) نستخدم بديلاً بسيطًا
-// حتى لا يتعطل تسجيل الدخول، مع العلم أن الحماية الحقيقية تعتمد أيضًا على رمز الحماية (Token).
-const HASH_ITERATIONS = 100000; // تكرار PBKDF2 يبطئ محاولات تخمين كلمات المرور من أي هاش مسرّب
-
-function randomHex_(numBytes){
-  const arr = new Uint8Array(numBytes);
-  window.crypto.getRandomValues(arr);
-  return Array.from(arr).map(b=>b.toString(16).padStart(2,'0')).join('');
-}
-function hexToBytes_(hex){
-  const bytes = new Uint8Array(hex.length/2);
-  for(let i=0;i<bytes.length;i++){ bytes[i] = parseInt(hex.substr(i*2,2),16); }
-  return bytes;
-}
-async function deriveHex_(pw, saltHex){
-  const keyMaterial = await window.crypto.subtle.importKey('raw', new TextEncoder().encode(pw), {name:'PBKDF2'}, false, ['deriveBits']);
-  const bits = await window.crypto.subtle.deriveBits({name:'PBKDF2', salt:hexToBytes_(saltHex), iterations:HASH_ITERATIONS, hash:'SHA-256'}, keyMaterial, 256);
-  return Array.from(new Uint8Array(bits)).map(b=>b.toString(16).padStart(2,'0')).join('');
-}
-
-// النسخة الجديدة المقوّاة (ملح عشوائي لكل حساب + تكرار اشتقاق) — تُستخدم لأي كلمة مرور تُنشأ أو تُعاد من الآن فصاعدًا
-async function hashPassword(pw){
-  try{
-    if(window.crypto && window.crypto.subtle){
-      const salt = randomHex_(16);
-      const derived = await deriveHex_(pw, salt);
-      return 'v2_' + salt + '_' + derived;
-    }
-  }catch(e){}
-  return await hashPasswordLegacy(pw);
-}
-
-// النسخة القديمة (هاش واحد بدون ملح) — تبقى فقط للتحقق من حسابات أُنشئت قبل هذا التحديث
-async function hashPasswordLegacy(pw){
-  try{
-    if(window.crypto && window.crypto.subtle){
-      const enc = new TextEncoder().encode(pw);
-      const buf = await window.crypto.subtle.digest('SHA-256', enc);
-      return Array.from(new Uint8Array(buf)).map(b=>b.toString(16).padStart(2,'0')).join('');
-    }
-  }catch(e){}
-  let h = 0;
-  const s = 'fallback:' + pw;
-  for(let i=0;i<s.length;i++){ h = (Math.imul(31,h) + s.charCodeAt(i))|0; }
-  return 'fb_' + (h>>>0).toString(16);
-}
-
-// يتحقق من كلمة المرور مهما كانت صيغة الهاش المخزّنة (جديدة أو قديمة)، لضمان عمل الحسابات الحالية دون انقطاع
-async function verifyPassword(pw, stored){
-  if(!stored) return false;
-  if(stored.indexOf('v2_')===0){
-    const rest = stored.slice(3);
-    const sep = rest.indexOf('_');
-    if(sep===-1) return false;
-    const salt = rest.slice(0, sep), expected = rest.slice(sep+1);
-    try{ return (await deriveHex_(pw, salt)) === expected; }
-    catch(e){ return false; }
-  }
-  return (await hashPasswordLegacy(pw)) === stored;
-}
-
 /* =======================================================================
-   طبقة الاتصال بقاعدة البيانات
+   طبقة الاتصال بقاعدة البيانات — Firebase (Firestore + Authentication)
+   ------------------------------------------------------------------------
+   استبدلت هذه الطبقة بالكامل الاعتماد السابق على Google Sheets/Apps Script
+   وتشفير كلمات المرور محليًا (PBKDF2). التحقق من الهوية الآن حقيقي عبر
+   Firebase Authentication، والتخزين عبر Firestore بقواعد أمان صارمة
+   (ملف firestore.rules المرفق). واجهة الدخول تبقى تمامًا كما كانت (اسم
+   مستخدم + كلمة مرور عاديين) — أي تحويل داخلي للبريد الاصطناعي الذي
+   تتطلبه Firebase يحدث خلف الكواليس دون أي أثر يظهر للمستخدم.
    ======================================================================= */
-const _cfgA = 'https://script.google.com/macros/s/AKfycbwvvlZFPOZeP5vuBgEW6ccueNTzDLRHUJUix5X8f5qFFaho0Z-qv97O8d6MXfRmQ4e5/exec';
-const _cfgB = '@Abuaasim11ijazat2026';
 
-function lsGet(k){ try{ return localStorage.getItem(k); }catch(e){ return null; } }
-function lsSet(k,v){ try{ localStorage.setItem(k,v); return true; }catch(e){ return false; } }
-function lsDel(k){ try{ localStorage.removeItem(k); }catch(e){} }
+const firebaseConfig = {
+  apiKey: "AIzaSyBaomfLI7bvjZ48FsfA5_StPgBOej-G2jE",
+  authDomain: "ijazat-app.firebaseapp.com",
+  projectId: "ijazat-app",
+  storageBucket: "ijazat-app.firebasestorage.app",
+  messagingSenderId: "354246948268",
+  appId: "1:354246948268:web:bbff49c66a80f48353f609"
+};
 
+const fbApp = initializeApp(firebaseConfig);
+const fbAuth = getAuth(fbApp);
+const fsDB = getFirestore(fbApp);
 
-function queryParam(name){
-  try{ return new URLSearchParams(window.location.search).get(name); }catch(e){ return null; }
+// تطبيق Firebase فرعي معزول تمامًا (بجلسة خاصة به) — يُستخدم فقط عند إنشاء حساب تسجيل دخول
+// لشخص آخر (مقرئ جديد، أو إعادة تعيين كلمة مرور مقرئ/مشرف) من داخل جلسة المشرف الحالية.
+// بدون هذا العزل، سيُسجَّل متصفح المشرف تلقائيًا بالحساب الجديد (سلوك Firebase الافتراضي عند
+// createUserWithEmailAndPassword)، فتنقطع جلسته الحالية فجأة بلا داعٍ.
+function freshSecondaryAuth_(){
+  const name = 'secondary_' + Date.now().toString(36) + Math.random().toString(36).slice(2,8);
+  const app2 = initializeApp(firebaseConfig, name);
+  return getAuth(app2);
 }
 
-let API = { url:'', token:'' };
-
-function resolveApiConfig(){
-  const qUrl = queryParam('api');
-  const qToken = queryParam('token');
-  if(qUrl){ lsSet('ijazat_api_url', qUrl); if(qToken!==null) lsSet('ijazat_api_token', qToken||''); }
-  API.url = lsGet('ijazat_api_url') || _cfgA || '';
-  API.token = lsGet('ijazat_api_token') || _cfgB || '';
+// Firebase Authentication يتطلب شكل بريد إلكتروني صالح دائمًا، حتى لو كان المستخدم الحقيقي
+// يكتب اسم مستخدم عاديًا فقط. هذا البريد "اصطناعي" بالكامل، داخلي، ولا يُستخدم لأي تواصل فعلي،
+// ولا يظهر لأي مستخدم في أي واجهة — فقط يُخزَّن في login_lookup للربط الداخلي.
+function syntheticEmail_(username){
+  const cleaned = username.toString().trim().toLowerCase().replace(/[^a-z0-9]/g,'') || 'u';
+  return `u${cleaned}.${Date.now().toString(36)}${Math.random().toString(36).slice(2,6)}@ijazat.internal`;
 }
-
-// حدّ خلية واحدة في Google Sheets هو 50,000 حرف. لتفادي الاصطدام بهذا الحد كلما كبرت
-// البيانات (مثل عدد كبير من الطلاب)، نُقسّم أي قيمة كبيرة تلقائيًا على عدة "خلايا" (مفاتيح)
-// ونعيد تجميعها عند القراءة — بدل تخزينها كلها في خلية واحدة محدودة السعة.
-const CHUNK_SIZE = 47000; // قريب من حد الخلية 50,000 قدر الإمكان، لتقليل عدد الأجزاء المطلوبة عند البيانات الكبيرة
-
-// Apps Script (ContentService) لا يملك طريقة مدعومة لإرسال رؤوس CORS، لذلك أي "fetch" عادي
-// لقراءة البيانات يُحجب من المتصفح — سواء من نطاق مختلف (GitHub) أو حتى عند "الاستضافة الذاتية"
-// من رابط /exec نفسه (لأن الصفحة تُخدَّم فعليًا من نطاق googleusercontent.com مختلف تمامًا عن
-// script.google.com خلف الكواليس، فتبقى المشكلة قائمة). الحل الرسمي المعتمد من جوجل نفسها لهذه
-// الحالة: تقنية JSONP (تحميل الرابط كـ"سكربت" بدل طلب Fetch)، فعناصر <script> لا تخضع لقيود
-// CORS إطلاقًا أيًا كان مصدرها.
-function jsonp_(url){
-  return new Promise((resolve, reject)=>{
-    const cbName = '_jsonp_cb_' + Date.now().toString(36) + Math.random().toString(36).slice(2);
-    const script = document.createElement('script');
-    let settled = false;
-    // التنظيف يحدث بعد جولة أحداث كاملة (وليس فورًا داخل الاستدعاء نفسه) لتفادي أي تعارض توقيت
-    const finish = (fn)=>{
-      if(settled) return; settled = true;
-      fn();
-      setTimeout(()=>{
-        try{ delete window[cbName]; }catch(e){}
-        if(script.parentNode) script.parentNode.removeChild(script);
-      }, 0);
-    };
-    window[cbName] = (data)=>{ finish(()=>resolve(data)); };
-    script.onerror = ()=>{ finish(()=>reject(new Error('jsonp_network_error'))); };
-    script.src = url + (url.indexOf('?')>-1?'&':'?') + 'callback=' + cbName;
-    document.body.appendChild(script);
-    setTimeout(()=>{ finish(()=>reject(new Error('jsonp_timeout'))); }, 20000);
-  });
-}
-// نفس jsonp_ لكن بمحاولتين إضافيتين تلقائيًا عند أي فشل عابر (شبكة بطيئة، تعارض توقيت نادر...)
-async function jsonpRetry_(url){
-  for(let attempt=0; attempt<3; attempt++){
-    try{ return await jsonp_(url); }
-    catch(e){ if(attempt===2) throw e; }
-  }
-}
-
-async function apiGetRaw_(key){
-  const u = `${API.url}?action=get&key=${encodeURIComponent(key)}${API.token?('&token='+encodeURIComponent(API.token)):''}`;
-  const data = await jsonpRetry_(u);
-  if(!data || data.error) return undefined;
-  return (data.value!==undefined && data.value!==null) ? data.value : undefined;
-}
-// الكتابة تبقى عبر POST عادي (لا قيد طول رابط)، لكن دون قراءة الاستجابة مباشرة (Fetch عبر
-// وضع no-cors يرسل الطلب وينفّذه Apps Script فعليًا، لكن لا يسمح المتصفح بقراءة ردّه لنفس
-// سبب CORS أعلاه) — لذلك نتحقق من نجاح الحفظ فعليًا عبر قراءة تأكيدية خفيفة (JSONP) بعدها.
-async function apiSetRaw_(key, rawString){
-  try{
-    await fetch(API.url, {
-      method:'POST',
-      mode:'no-cors',
-      headers:{'Content-Type':'text/plain;charset=utf-8'},
-      body: JSON.stringify({ action:'set', key, value: rawString, token: API.token })
-    });
-  }catch(e){ return false; }
-  // تحقّق فعلي أن الكتابة وصلت وتمّت (وليس مجرد افتراض نجاح لعدم وجود خطأ شبكة)
-  try{
-    const check = await apiGetRaw_(key);
-    return check===rawString;
-  }catch(e){ return false; }
-}
-
-// نظام تخزين "ذرّي": كل عملية حفظ تكتب نسخة جديدة كاملة تحت مفاتيح جديدة تمامًا (لا تُكتب فوق
-// القديمة أبدًا)، ولا يتم "تحويل" القراء للنسخة الجديدة إلا بخطوة أخيرة واحدة بعد نجاح كل شيء
-// 100%. هذا يضمن أن أي قارئ يرى دائمًا إما النسخة القديمة كاملة أو الجديدة كاملة — لا يمكن أبدًا
-// أن يرى مزيجًا فاسدًا من الاثنين، حتى لو تعطّل الحفظ في منتصفه تمامًا (سبب حقيقي شوهد سابقًا).
-function randVersion_(){
-  return Date.now().toString(36) + Math.random().toString(36).slice(2,8);
-}
-
-async function apiGet(key){
-  const version = await apiGetRaw_(`${key}__current_version`);
-  if(version){
-    const chunksRaw = await apiGetRaw_(`${key}__v${version}__chunks`);
-    if(chunksRaw===undefined) throw new Error('critical_read_failure'); // إصدار موجود لكن عداده غائب = فشل حقيقي
-    const chunkCount = parseInt(chunksRaw||'0',10);
-    if(chunkCount<=0) return null;
-    const parts = await Promise.all(Array.from({length:chunkCount}, (_,i)=>apiGetRaw_(`${key}__v${version}__chunk_${i}`)));
-    if(parts.some(p=>p===undefined)) throw new Error('critical_read_failure'); // جزء متوقَّع غائب = فشل حقيقي، وليس "فارغ"
-    return JSON.parse(parts.join(''));
-  }
-  // توافق مع بيانات قديمة أُنشئت قبل هذا التحديث (نظام التجزئة السابق بدون إصدارات)
-  const legacyChunksRaw = await apiGetRaw_(key+'__chunks');
-  const legacyChunkCount = legacyChunksRaw? parseInt(legacyChunksRaw,10): 0;
-  if(legacyChunkCount>0){
-    const parts = await Promise.all(Array.from({length:legacyChunkCount}, (_,i)=>apiGetRaw_(`${key}__chunk_${i}`)));
-    if(parts.some(p=>p===undefined)) throw new Error('critical_read_failure');
-    return JSON.parse(parts.join(''));
-  }
-  const raw = await apiGetRaw_(key);
-  if(raw===undefined || raw==='') return null; // لا وجود لأي أثر لهذا المفتاح = فارغ فعليًا (وليس فشلاً)
-  return JSON.parse(raw);
-}
-// بديل احتياطي أبطأ لكن أكثر متانة: يجلب كل مفتاح على حدة بطلبات منفصلة (بدل طلب واحد ضخم)،
-// يُستخدم فقط لو تكرر فشل الطلب المُجمَّع — مفيد للحسابات الكبيرة جدًا (آلاف الطلاب) حيث قد
-// تكون الاستجابة المُجمَّعة الواحدة كبيرة جدًا وعرضة للاقتطاع الجزئي.
-async function apiGetAllViaIndividualKeys_(){
-  try{
-    const [config, plans, attendance, harvest, examinations] = await Promise.all([
-      apiGet('config'), apiGet('plans'), apiGet('attendance'), apiGet('harvest'), apiGet('examinations')
-    ]);
-    return {config, plans, attendance, harvest, examinations};
-  }catch(e){ return null; }
-}
-async function apiSet(key, value){
-  try{
-    const json = JSON.stringify(value);
-    const version = randVersion_();
-    const parts = [];
-    for(let i=0;i<json.length;i+=CHUNK_SIZE) parts.push(json.slice(i,i+CHUNK_SIZE));
-    if(!parts.length) parts.push('');
-    // 1) نكتب كل الأجزاء الجديدة أولًا تحت مفاتيح جديدة كليًا — لا تؤثر على ما يقرأه أي شخص الآن
-    for(let i=0;i<parts.length;i++){
-      const ok = await apiSetRaw_(`${key}__v${version}__chunk_${i}`, parts[i]);
-      if(!ok) return false; // فشل هنا = لا ضرر، النسخة القديمة تبقى "الحقيقة" كما هي
-    }
-    const okCount = await apiSetRaw_(`${key}__v${version}__chunks`, String(parts.length));
-    if(!okCount) return false;
-    // 2) نقطة التحويل الذرّية الوحيدة: بمجرد نجاح هذا السطر فقط، يرى كل قارئ جديد النسخة الجديدة كاملة
-    return await apiSetRaw_(`${key}__current_version`, version);
-  }catch(e){ return false; }
-}
-async function apiTest(){
-  try{
-    const u = `${API.url}?action=get&key=__ping__${API.token?('&token='+encodeURIComponent(API.token)):''}`;
-    const data = isSelfHostedContext_() ? await fetchRetry_(u) : await jsonpRetry_(u);
-    return !!data && !data.error;
-  }catch(e){ return false; }
+// يُنشئ حساب Firebase Authentication جديدًا كليًا لمستخدم (مقرئ/مشرف)، عبر التطبيق الفرعي
+// المعزول أعلاه (فلا يؤثر على جلسة المشرف الحالي)، ثم يكتب ملفه الشخصي (users/{uid}) ومدخل
+// الدخول العلني (login_lookup/{username} → البريد الاصطناعي). يُستخدم عند إضافة مقرئ/مشرف
+// جديد، وأيضًا عند "إعادة تعيين كلمة المرور" (بإنشاء حساب جديد كليًا بدل تعديل القديم —
+// الحل الوحيد بلا تكلفة لأن Firebase Authentication لا يسمح لأي مستخدم، ولو كان مشرفًا، بتغيير
+// كلمة مرور مستخدم آخر مباشرة من المتصفح؛ الحساب القديم يبقى معلّقًا بلا ضرر ولا تكلفة).
+async function createLoginAccount_(username, name, role, refId, password){
+  const secAuth = freshSecondaryAuth_();
+  const email = syntheticEmail_(username);
+  const cred = await createUserWithEmailAndPassword(secAuth, email, password);
+  const newUid = cred.user.uid;
+  try{ await fbSignOut(secAuth); }catch(e){}
+  await setDoc(doc(fsDB, 'users', newUid), { role, refId, name });
+  await setDoc(doc(fsDB, 'login_lookup', username), { authEmail: email });
+  return newUid;
 }
 
 function showToast(msg){
@@ -643,119 +490,141 @@ function showToast(msg){
   showToast._tm = setTimeout(()=>t.classList.remove('show'), 2200);
 }
 
-async function saveConfig(){ const ok = await apiSet('config', DB.config); if(!ok) showToast('تعذر الحفظ في قاعدة البيانات، تحقق من الاتصال'); return ok; }
-async function savePlans(){ const ok = await apiSet('plans', DB.plans); if(!ok) showToast('تعذر حفظ الخطط، تحقق من الاتصال'); return ok; }
-async function saveAttendance(){ const ok = await apiSet('attendance', DB.attendance); if(!ok) showToast('تعذر حفظ التحضير، تحقق من الاتصال'); return ok; }
-async function saveHarvest(){ const ok = await apiSet('harvest', DB.harvest); if(!ok) showToast('تعذر حفظ الحصاد، تحقق من الاتصال'); return ok; }
-async function saveExaminations(){ const ok = await apiSet('examinations', DB.examinations); if(!ok) showToast('تعذر حفظ بيانات لجنة الاختبار، تحقق من الاتصال'); return ok; }
-function saveSession(){ if(session) lsSet('ijazat_session', JSON.stringify(session)); else lsDel('ijazat_session'); }
+/* ---------------- محرّك المزامنة الفرقية (diff sync) مع Firestore ---------------- */
+// بدل إعادة كتابة كل سجل في كل مرة (مكلف جدًا على مقياس الفوترة في Firestore حين يكون هناك
+// آلاف الطلاب)، نحتفظ بنسخة من آخر حالة "تمت مزامنتها بنجاح" لكل مجموعة، ونحسب فقط الفرق
+// الحقيقي (إضافة/تعديل/حذف)، ثم نكتب هذا الفرق فقط، على دفعات لا تتجاوز 450 عملية للدفعة
+// (الحد الفعلي لفايرستور هو 500 عملية في كل دفعة واحدة).
+let lastSynced = { reciters:[], circles:[], students:[], supervisors:[], plans:[], attendance:[], harvest:[], examinations:[], settings:null };
 
-let apiConfigured = false;
-let apiConnectionError = false;
+function cloneDeep_(v){ return v===undefined ? v : JSON.parse(JSON.stringify(v)); }
+
+async function commitOps_(ops){
+  for(let i=0;i<ops.length;i+=450){
+    const batch = writeBatch(fsDB);
+    ops.slice(i,i+450).forEach(op=>{
+      if(op.type==='set') batch.set(op.ref, op.data);
+      else batch.delete(op.ref);
+    });
+    await batch.commit();
+  }
+}
+
+// يحسب فرق مصفوفة من السجلات (كل سجل فيه id) مقابل آخر نسخة مُزامنة، لمجموعة Firestore معيّنة
+function diffArrayOps_(collectionName, current, previous){
+  const ops = [];
+  const prevMap = new Map((previous||[]).map(x=>[x.id, x]));
+  const curMap = new Map((current||[]).map(x=>[x.id, x]));
+  for(const [id, item] of curMap){
+    const prevItem = prevMap.get(id);
+    if(!prevItem || JSON.stringify(prevItem)!==JSON.stringify(item)){
+      const { id:_drop, ...rest } = item;
+      ops.push({ type:'set', ref: doc(fsDB, collectionName, id), data: rest });
+    }
+  }
+  for(const [id] of prevMap){
+    if(!curMap.has(id)) ops.push({ type:'delete', ref: doc(fsDB, collectionName, id) });
+  }
+  return ops;
+}
+
+async function syncArrayCollection_(collectionName, current, prevKey){
+  try{
+    const ops = diffArrayOps_(collectionName, current, lastSynced[prevKey]);
+    if(ops.length) await commitOps_(ops);
+    lastSynced[prevKey] = cloneDeep_(current);
+    return true;
+  }catch(e){ return false; }
+}
+
+async function fetchCollection_(name){
+  const snap = await getDocs(collection(fsDB, name));
+  const out = [];
+  snap.forEach(d=> out.push({ id:d.id, ...d.data() }));
+  return out;
+}
+
+/* ---------------- دوال الحفظ (نفس الاسم والتوقيع المستخدم في كل الكود الحالي) ---------------- */
+async function saveConfig(){
+  const okReciters = await syncArrayCollection_('reciters', DB.config.reciters, 'reciters');
+  const okCircles = await syncArrayCollection_('circles', DB.config.circles, 'circles');
+  const okStudents = await syncArrayCollection_('students', DB.config.students, 'students');
+  const okSupervisors = await syncArrayCollection_('supervisors', DB.config.supervisors, 'supervisors');
+  let okSettings = true;
+  const settingsNow = { qiraahOptions: DB.config.qiraahOptions||[], planTypes: DB.config.planTypes||[] };
+  if(JSON.stringify(settingsNow) !== JSON.stringify(lastSynced.settings)){
+    try{ await setDoc(doc(fsDB,'settings','general'), settingsNow); lastSynced.settings = cloneDeep_(settingsNow); }
+    catch(e){ okSettings = false; }
+  }
+  const ok = okReciters && okCircles && okStudents && okSupervisors && okSettings;
+  if(!ok) showToast('تعذر الحفظ في قاعدة البيانات، تحقق من الاتصال');
+  return ok;
+}
+async function savePlans(){ const ok = await syncArrayCollection_('plans', DB.plans, 'plans'); if(!ok) showToast('تعذر حفظ الخطط، تحقق من الاتصال'); return ok; }
+async function saveAttendance(){ const ok = await syncArrayCollection_('attendance', DB.attendance, 'attendance'); if(!ok) showToast('تعذر حفظ التحضير، تحقق من الاتصال'); return ok; }
+async function saveHarvest(){ const ok = await syncArrayCollection_('harvest', DB.harvest, 'harvest'); if(!ok) showToast('تعذر حفظ الحصاد، تحقق من الاتصال'); return ok; }
+async function saveExaminations(){ const ok = await syncArrayCollection_('examinations', DB.examinations, 'examinations'); if(!ok) showToast('تعذر حفظ بيانات لجنة الاختبار، تحقق من الاتصال'); return ok; }
+// Firebase Authentication يحفظ جلسة الدخول تلقائيًا وبأمان (IndexedDB) — لا حاجة لأي حفظ يدوي هنا.
+// الدالة باقية فقط حتى لا نحتاج لتعديل كل موضع استدعاء لها في بقية الكود.
+function saveSession(){}
 
 let dataFullyLoaded = false;
 
-// يجلب الجدول بأكمله بطلب واحد فقط (بدل عشرات الطلبات المتتابعة لكل مفتاح وكل جزء)، ثم يُعيد
-// تجميع كل مفتاح (config/plans/attendance/harvest/examinations) من طرف المتصفح مباشرة — هذا
-// يُسرّع فتح البرنامج بشكل كبير جدًا لأن زمن الشبكة (وخصوصًا أي بطء من جهة Apps Script) يُدفع
-// مرة واحدة فقط، بدل مرة لكل جزء من كل مفتاح.
-async function apiGetAllResolved_(){
-  const u = `${API.url}?action=getAll${API.token?('&token='+encodeURIComponent(API.token)):''}`;
-  const data = await jsonpRetry_(u);
-  if(!data || !data.ok) return null;
-  const raw = data.data || {};
-  let hadCriticalFailure = false; // فشل حقيقي في التجميع (وليس "لا توجد بيانات أصلاً")
-  function resolveKey(key){
-    const version = raw[`${key}__current_version`];
-    if(version){
-      const chunkCountRaw = raw[`${key}__v${version}__chunks`];
-      if(chunkCountRaw===undefined){ hadCriticalFailure = true; return null; } // يوجد إصدار لكن عداد أجزائه غائب — فشل قراءة حقيقي
-      const chunkCount = parseInt(chunkCountRaw||'0',10);
-      if(chunkCount<=0) return null; // فارغة فعليًا (0 عنصر)، وليست فشلاً
-      const parts = [];
-      for(let i=0;i<chunkCount;i++){
-        const part = raw[`${key}__v${version}__chunk_${i}`];
-        // جزء متوقَّع لكنه غائب = فشل قراءة حقيقي (مثل استجابة كبيرة جدًا اقتُطعت جزئيًا)
-        // — لا نُعامله أبدًا كـ"لا توجد بيانات"، تجنّبًا لخطر الكتابة فوق بيانات حقيقية لاحقًا بقيمة فارغة
-        if(part===undefined){ hadCriticalFailure = true; return null; }
-        parts.push(part);
-      }
-      try{ return JSON.parse(parts.join('')); }catch(e){ hadCriticalFailure = true; return null; }
-    }
-    // توافق مع بيانات قديمة أُنشئت قبل نظام الإصدارات الذرّي
-    const legacyChunkCount = parseInt(raw[`${key}__chunks`]||'0',10);
-    if(legacyChunkCount>0){
-      const parts = [];
-      for(let i=0;i<legacyChunkCount;i++){
-        const part = raw[`${key}__chunk_${i}`];
-        if(part===undefined){ hadCriticalFailure = true; return null; }
-        parts.push(part);
-      }
-      try{ return JSON.parse(parts.join('')); }catch(e){ hadCriticalFailure = true; return null; }
-    }
-    const plain = raw[key];
-    if(plain===undefined || plain==='') return null; // لا يوجد أي أثر لهذا المفتاح إطلاقًا = فارغ فعليًا
-    try{ return JSON.parse(plain); }catch(e){ hadCriticalFailure = true; return null; }
-  }
-  const resolved = {
-    config: resolveKey('config'),
-    plans: resolveKey('plans'),
-    attendance: resolveKey('attendance'),
-    harvest: resolveKey('harvest'),
-    examinations: resolveKey('examinations'),
+/* ---------------- تحميل كل البيانات من Firestore بعد نجاح تسجيل الدخول ---------------- */
+async function loadAllData_(){
+  const [reciters, circles, students, supervisors, plans, attendance, harvest, examinations, settingsSnap] = await Promise.all([
+    fetchCollection_('reciters'), fetchCollection_('circles'), fetchCollection_('students'), fetchCollection_('supervisors'),
+    fetchCollection_('plans'), fetchCollection_('attendance'), fetchCollection_('harvest'), fetchCollection_('examinations'),
+    getDoc(doc(fsDB,'settings','general'))
+  ]);
+  const settings = settingsSnap.exists() ? settingsSnap.data() : {};
+  DB.config = {
+    reciters, circles, students, supervisors,
+    qiraahOptions: (settings.qiraahOptions && settings.qiraahOptions.length) ? settings.qiraahOptions : [...DEFAULT_QIRAAH_OPTIONS],
+    planTypes: (settings.planTypes && settings.planTypes.length) ? settings.planTypes : [...DEFAULT_PLAN_TYPES],
   };
-  // لو فشل تجميع أي مفتاح فشلاً حقيقيًا (وليس مجرد عدم وجوده)، نُرجع null بالكامل — هذا يجعل init()
-  // يتعامل معها كفشل اتصال يستحق إعادة المحاولة، بدل المتابعة ببيانات فارغة قد تُحفَظ لاحقًا بالخطأ
-  if(hadCriticalFailure) return null;
-  return resolved;
+  DB.plans = plans; DB.attendance = attendance; DB.harvest = harvest; DB.examinations = examinations;
+
+  lastSynced = {
+    reciters: cloneDeep_(reciters), circles: cloneDeep_(circles), students: cloneDeep_(students), supervisors: cloneDeep_(supervisors),
+    plans: cloneDeep_(plans), attendance: cloneDeep_(attendance), harvest: cloneDeep_(harvest), examinations: cloneDeep_(examinations),
+    settings: cloneDeep_({ qiraahOptions: DB.config.qiraahOptions, planTypes: DB.config.planTypes }),
+  };
+  dataFullyLoaded = true;
 }
 
-async function init(){
-  resolveApiConfig();
-  apiConfigured = !!API.url;
-  if(!apiConfigured){ ready = true; render(); return; }
-
-  let resolved = null;
-  for(let attempt=0; attempt<3 && !resolved; attempt++){
-    resolved = await apiGetAllResolved_();
-  }
-  if(!resolved){
-    // فشل الطلب المُجمَّع (قد يكون بسبب حجم بيانات كبير جدًا اقتُطع جزئيًا) — نجرّب البديل
-    // الأبطأ لكن الأكثر متانة: جلب كل مفتاح على حدة بطلب منفصل، قبل الاستسلام نهائيًا
-    resolved = await apiGetAllViaIndividualKeys_();
-  }
-  if(!resolved){
-    const ok = await apiTest();
-    if(!ok){ apiConnectionError = true; ready = true; render(); return; }
-    resolved = await apiGetAllViaIndividualKeys_(); // نجح ping لكن فشلت القراءة، حاول أخيرة بالطريقة المتينة
-  }
-  if(!resolved){ apiConnectionError = true; ready = true; render(); return; }
-  apiConnectionError = false;
-
-  DB.config = resolved.config || { reciters:[], circles:[], students:[], qiraahOptions:[...DEFAULT_QIRAAH_OPTIONS], planTypes:[...DEFAULT_PLAN_TYPES], supervisors:[] };
-  if(!DB.config.qiraahOptions || !DB.config.qiraahOptions.length) DB.config.qiraahOptions = [...DEFAULT_QIRAAH_OPTIONS];
-  if(!DB.config.planTypes || !DB.config.planTypes.length) DB.config.planTypes = [...DEFAULT_PLAN_TYPES];
-  if(!DB.config.supervisors) DB.config.supervisors = [];
-  DB.plans = resolved.plans || [];
-  DB.attendance = resolved.attendance || [];
-  DB.harvest = resolved.harvest || [];
-  DB.examinations = resolved.examinations || [];
-  dataFullyLoaded = true; // كل البيانات وصلت دفعة واحدة الآن — لا حاجة لمرحلة تحميل خلفية منفصلة
-
-  try{ session = JSON.parse(lsGet('ijazat_session')||'null'); }catch(e){ session = null; }
-  // تحقق أن الحساب المحفوظ محليًا ما زال موجودًا فعليًا في قاعدة البيانات (لم يُحذف)
-  if(session){
-    if(session.role==='supervisor' && !DB.config.supervisors.find(s=>s.id===session.id)){
-      session=null;
-    }else if(session && session.role==='reciter'){
-      const rAcc = DB.config.reciters.find(r=>r.id===session.reciterId);
-      if(!rAcc) session=null; else session.isExaminer = !!rAcc.isExaminer; // مزامنة صلاحية المختبر مع أحدث بيانات
+/* ---------------- بدء التطبيق: الاستماع لحالة تسجيل الدخول ---------------- */
+function init(){
+  onAuthStateChanged(fbAuth, async (user)=>{
+    try{
+      if(user){
+        const profileSnap = await getDoc(doc(fsDB, 'users', user.uid));
+        if(!profileSnap.exists()){
+          // حساب موجود في Authentication لكن بلا ملف تعريف مطابق (حالة غير متوقعة) — نسجّل خروجه فورًا
+          await fbSignOut(fbAuth);
+          session = null; ready = true; render(); return;
+        }
+        const profile = profileSnap.data();
+        await loadAllData_();
+        if(profile.role==='supervisor'){
+          session = { role:'supervisor', name:profile.name, id:profile.refId };
+        }else{
+          const rAcc = DB.config.reciters.find(r=>r.id===profile.refId);
+          session = { role:'reciter', name:profile.name, reciterId:profile.refId, isExaminer: !!(rAcc && rAcc.isExaminer) };
+        }
+        currentTab = session.role==='supervisor' ? 'overview' : 'my-circles';
+      }else{
+        session = null;
+        dataFullyLoaded = false;
+        loginSubmitting = false;
+      }
+    }catch(e){
+      session = null;
+      loginSubmitting = false;
     }
-    if(!session) saveSession();
-  }
-  ready = true;
-  currentTab = session ? (session.role==='supervisor' ? 'overview' : 'my-circles') : null;
-  render();
+    ready = true;
+    render();
+  });
 }
 
 /* ---------------- lookups ---------------- */
@@ -811,7 +680,6 @@ function progressColor(pct){
 function render(){
   const app = document.getElementById('app');
   if(!ready){ app.innerHTML = `<div class="splash"><div class="spinner"></div><div>جاري تحميل بيانات الشعبة…</div></div>`; return; }
-  if(!apiConfigured || apiConnectionError){ app.innerHTML = renderSetup(); attachSetupEvents(); return; }
   if(!session){ app.innerHTML = renderLogin(); attachLoginEvents(); return; }
 
   // تحديث خفيف: إن كان الهيكل (القائمة الجانبية) معروضًا بالفعل، نحدّث فقط المحتوى وعنوان
@@ -837,74 +705,14 @@ function render(){
   attachShellEvents();
 }
 
-/* ======================= SETUP / CONNECTION SCREEN ======================= */
-let setupTesting = false;
-let setupError = '';
-
-function renderSetup(){
-  return `
-  <div class="login-wrap">
-    <div class="login-card" style="max-width:520px;">
-      <div class="login-head">
-        <div class="eyebrow">المسجد النبوي الشريف</div>
-        <h1>شعبة إجازات القرآن الكريم</h1>
-        <p>ربط البرنامج بقاعدة بيانات Google Drive</p>
-        <svg viewBox="0 0 400 40" preserveAspectRatio="none"><path d="M0,40 L0,20 Q100,0 200,20 T400,20 L400,40 Z" fill="#F6F1E4"/></svg>
-      </div>
-      <div class="login-body">
-        ${apiConnectionError ? `<div class="error-box">تعذّر الاتصال بالرابط المحفوظ. تأكد أن رابط تطبيق الويب صحيح وأنه منشور بصلاحية "Anyone"، ثم أعد المحاولة.</div>` : ''}
-        ${setupError ? `<div class="error-box">${esc(setupError)}</div>` : ''}
-        <div class="hint" style="margin:0 0 16px;text-align:right;">
-          يعتمد هذا البرنامج على جدول Google Sheets كقاعدة بيانات، عبر رابط "تطبيق ويب" (Web App) من Google Apps Script.
-          هذه الخطوة تُعمل مرة واحدة فقط من قبل المشرف، ثم يُشارك نفس الرابط مع بقية الأجهزة.
-        </div>
-        <form id="setupForm">
-          <div class="field">
-            <label>رابط تطبيق الويب (ينتهي بـ /exec)</label>
-            <input type="text" name="url" placeholder="https://script.google.com/macros/s/xxxxx/exec" value="${esc(lsGet('ijazat_api_url')||'')}" required>
-          </div>
-          <div class="field">
-            <label>رمز حماية اختياري (Token) — إن وُجد</label>
-            <input type="password" name="token" placeholder="اتركه فارغًا إن لم تُفعّل الحماية" value="${esc(lsGet('ijazat_api_token')||'')}" autocomplete="off">
-          </div>
-          <button type="submit" class="btn btn-primary btn-block">${setupTesting?'جاري الاختبار…':'اتصال وحفظ'}</button>
-        </form>
-        <div class="hint">لم تُنشئ قاعدة البيانات بعد؟ اطلب من المشرف اتباع خطوات الإعداد المرفقة (نسخ كود Apps Script ونشره كتطبيق ويب)، ثم الصق الرابط الناتج هنا.</div>
-      </div>
-    </div>
-  </div>`;
-}
-
-function attachSetupEvents(){
-  const form = document.getElementById('setupForm');
-  if(!form) return;
-  form.addEventListener('submit', async (e)=>{
-    e.preventDefault();
-    const fd = new FormData(form);
-    const url = (fd.get('url')||'').toString().trim();
-    const token = (fd.get('token')||'').toString().trim();
-    if(!url){ setupError='يرجى إدخال الرابط'; render(); return; }
-    lsSet('ijazat_api_url', url);
-    lsSet('ijazat_api_token', token);
-    API.url = url; API.token = token;
-    setupTesting = true; setupError=''; render();
-    const ok = await apiTest();
-    setupTesting = false;
-    if(!ok){ apiConnectionError = true; setupError='تعذّر الاتصال بهذا الرابط. تحقق منه ومن إعدادات النشر ثم حاول مجددًا.'; render(); return; }
-    apiConnectionError = false; apiConfigured = true;
-    ready = false; render();
-    await init();
-  });
-}
 
 /* ======================= LOGIN ======================= */
-let loginRole = 'supervisor';
 let loginError = '';
 let loginAttempts = 0;
 let loginLockUntil = 0;
+let loginSubmitting = false;
 
 function renderLogin(){
-  const reciters = DB.config.reciters;
   return `
   <div class="login-wrap">
     <div class="login-card">
@@ -916,64 +724,29 @@ function renderLogin(){
       </div>
       <div class="login-body">
         ${loginError ? `<div class="error-box">${esc(loginError)}</div>` : ''}
-
-        ${DB.config.supervisors.length===0 ? `
-          <div class="hint" style="text-align:right;margin:0 0 16px;">
-            لا يوجد حساب مشرف بعد على قاعدة البيانات المتصلة حاليًا. أنشئ أول حساب مشرف الآن، أو غيّر رابط الاتصال أدناه إن كنت تقصد قاعدة بيانات أخرى.
+        <form id="loginForm">
+          <div class="field">
+            <label>اسم المستخدم</label>
+            <input type="text" name="username" required placeholder="اسم المستخدم" autocomplete="username">
           </div>
-          <form id="bootstrapForm">
-            <div class="field"><label>اسم المشرف</label><input type="text" name="name" required placeholder="مثال: الشيخ عبدالله الحربي"></div>
-            <div class="field"><label>البريد الإلكتروني أو اسم المستخدم</label><input type="text" name="username" required placeholder="مثال: abdullah أو abdullah@yourdomain.com"></div>
-            <div class="field"><label>كلمة المرور</label><input type="password" name="password" required minlength="4"></div>
-            <div class="field"><label>تأكيد كلمة المرور</label><input type="password" name="password2" required minlength="4"></div>
-            <button type="submit" class="btn btn-primary btn-block">إنشاء الحساب والدخول</button>
-          </form>
-        ` : `
-          <form id="loginForm">
-            <div class="field">
-              <label>البريد الإلكتروني أو اسم المستخدم</label>
-              <input type="text" name="username" required placeholder="بريدك الإلكتروني أو اسم المستخدم">
-            </div>
-            <div class="field">
-              <label>كلمة المرور</label>
-              <input type="password" name="password" required>
-            </div>
-            <button type="submit" class="btn btn-primary btn-block">دخول</button>
-          </form>
-          <div class="hint">تُحدَّد صلاحياتك تلقائيًا بعد الدخول بحسب نوع حسابك (مشرف أو مقرئ).</div>
-        `}
-
+          <div class="field">
+            <label>كلمة المرور</label>
+            <input type="password" name="password" required autocomplete="current-password">
+          </div>
+          <button type="submit" class="btn btn-primary btn-block">${loginSubmitting?'جاري الدخول…':'دخول'}</button>
+        </form>
+        <div class="hint">تُحدَّد صلاحياتك تلقائيًا بعد الدخول بحسب نوع حسابك (مشرف أو مقرئ).</div>
       </div>
     </div>
   </div>`;
 }
 
 function attachLoginEvents(){
-  const bootstrapForm = document.getElementById('bootstrapForm');
-  if(bootstrapForm){
-    bootstrapForm.addEventListener('submit', async (e)=>{
-      e.preventDefault();
-      const fd = new FormData(bootstrapForm);
-      const name=(fd.get('name')||'').toString().trim();
-      const username=(fd.get('username')||'').toString().trim();
-      const password=(fd.get('password')||'').toString();
-      const password2=(fd.get('password2')||'').toString();
-      if(!name||!username||!password){ loginError='يرجى تعبئة جميع الحقول'; render(); return; }
-      if(password!==password2){ loginError='كلمتا المرور غير متطابقتين'; render(); return; }
-      const passwordHash = await hashPassword(password);
-      const rec = {id:uid(), name, username, passwordHash};
-      DB.config.supervisors.push(rec);
-      await saveConfig();
-      session = { role:'supervisor', name:rec.name, id:rec.id };
-      saveSession();
-      currentTab='overview'; render();
-    });
-  }
-
   const form = document.getElementById('loginForm');
   if(form){
     form.addEventListener('submit', async (e)=>{
       e.preventDefault();
+      if(loginSubmitting) return;
       if(Date.now() < loginLockUntil){
         const secs = Math.ceil((loginLockUntil - Date.now())/1000);
         loginError = `محاولات كثيرة فاشلة. يرجى الانتظار ${secs} ثانية ثم أعد المحاولة.`; render(); return;
@@ -981,38 +754,24 @@ function attachLoginEvents(){
       const fd = new FormData(form);
       const username = (fd.get('username')||'').toString().trim();
       const password = (fd.get('password')||'').toString();
-      if(!username||!password){ loginError='يرجى إدخال البريد الإلكتروني أو اسم المستخدم وكلمة المرور'; render(); return; }
+      if(!username||!password){ loginError='يرجى إدخال اسم المستخدم وكلمة المرور'; render(); return; }
 
-      let ok = false, matchedAccount = null, isSupervisor = false;
-      const supAcc = DB.config.supervisors.find(s=>s.username===username);
-      if(supAcc && await verifyPassword(password, supAcc.passwordHash)){
-        ok = true; matchedAccount = supAcc; isSupervisor = true;
-      }else{
-        const r = DB.config.reciters.find(r=>r.username===username || r.email===username);
-        if(r && r.passwordHash && await verifyPassword(password, r.passwordHash)){
-          ok = true; matchedAccount = r; isSupervisor = false;
-        }
-      }
-
-      if(!ok){
+      loginSubmitting = true; loginError=''; render();
+      try{
+        // دليل عام (بلا كلمات مرور) يربط اسم المستخدم بالبريد الاصطناعي الحقيقي في Firebase
+        // Authentication — هذا ما يُمكّن شاشة الدخول من العمل قبل تسجيل الدخول فعليًا.
+        const lookupSnap = await getDoc(doc(fsDB, 'login_lookup', username));
+        if(!lookupSnap.exists()) throw new Error('not_found');
+        const { authEmail } = lookupSnap.data();
+        await signInWithEmailAndPassword(fbAuth, authEmail, password);
+        // onAuthStateChanged سيتولى تحميل البيانات وعرض الواجهة المناسبة تلقائيًا بعد نجاح الدخول
+        loginAttempts = 0;
+      }catch(e){
         loginAttempts++;
         if(loginAttempts>=5){ loginLockUntil = Date.now()+30000; loginAttempts=0; }
-        loginError='بيانات الدخول غير صحيحة'; render(); return;
+        loginError='بيانات الدخول غير صحيحة';
+        loginSubmitting = false; render();
       }
-      loginAttempts = 0;
-
-      // ترقية صامتة لأي هاش قديم (من قبل هذا التحديث) لصيغة أقوى، دون مطالبة المستخدم بأي شيء
-      if(matchedAccount.passwordHash.indexOf('v2_')!==0){
-        matchedAccount.passwordHash = await hashPassword(password);
-        saveConfig();
-      }
-
-      if(isSupervisor) session = { role:'supervisor', name:matchedAccount.name, id:matchedAccount.id };
-      else session = { role:'reciter', name:matchedAccount.name, reciterId:matchedAccount.id, isExaminer:!!matchedAccount.isExaminer };
-
-      saveSession();
-      currentTab = session.role==='supervisor' ? 'overview' : 'my-circles';
-      render();
     });
   }
 }
@@ -1068,10 +827,6 @@ function renderShell(){
       </nav>
       <div class="sidebar-foot">
         <button class="logout-btn" id="logoutBtn">تسجيل الخروج</button>
-        ${session.role==='supervisor' ? `
-        <div style="text-align:center;margin-top:10px;">
-          <a href="#" id="settingsLink" style="color:#CBDAD2;font-size:11.5px;text-decoration:underline;">إعدادات الاتصال بقاعدة البيانات</a>
-        </div>` : ''}
       </div>
     </aside>
     <main class="main">
@@ -1106,10 +861,7 @@ function attachShellEvents(){
     b.addEventListener('click', ()=>{ currentTab = b.dataset.tab; mobileMenuOpen = false; render(); });
   });
   const lo = document.getElementById('logoutBtn');
-  if(lo) lo.addEventListener('click', async ()=>{ session=null; mobileMenuOpen=false; saveSession(); render(); });
-
-  const setLink = document.getElementById('settingsLink');
-  if(setLink) setLink.addEventListener('click', (e)=>{ e.preventDefault(); apiConfigured=false; render(); });
+  if(lo) lo.addEventListener('click', async ()=>{ mobileMenuOpen=false; try{ await fbSignOut(fbAuth); }catch(e){} });
 
   const hamburger = document.getElementById('hamburgerBtn');
   if(hamburger) hamburger.addEventListener('click', ()=>{ mobileMenuOpen = true; render(); });
@@ -1685,8 +1437,8 @@ async function processImportFile(file){
     if(!name || !username || !email || !password){ errors.push(`المقرئون، صف ${i+2}: بيانات ناقصة، تم التجاهل.`); return; }
     if(DB.config.reciters.some(r=>r.username===username)){ errors.push(`المقرئون، صف ${i+2}: اسم المستخدم "${username}" مستخدم مسبقًا، تم التجاهل.`); return; }
     if(DB.config.reciters.some(r=>r.email===email)){ errors.push(`المقرئون، صف ${i+2}: البريد "${email}" مستخدم مسبقًا، تم التجاهل.`); return; }
-    // كلمة المرور ستُشفّر لاحقًا دفعة واحدة (انظر أدناه)
-    DB.config.reciters.push({id:uid(), name, username, email, passwordHash:null, __pendingPassword:password});
+    // حساب تسجيل الدخول الحقيقي (Firebase Authentication) يُنشأ لاحقًا دفعة واحدة (انظر أدناه)
+    DB.config.reciters.push({id:uid(), name, username, email, __pendingPassword:password});
     addedReciters++;
   });
 
@@ -1746,10 +1498,12 @@ async function processImportFile(file){
     addedStudents++;
   });
 
-  // تشفير كلمات مرور المقرئين المُضافين دفعة واحدة
+  // إنشاء حساب دخول حقيقي (Firebase Authentication) لكل مقرئ جديد أُضيف في هذا الاستيراد —
+  // يتطلب طلب شبكة فعلي لكل حساب، فتُنشأ الحسابات بالتتابع وليس دفعة واحدة
   for(const r of DB.config.reciters){
     if(r.__pendingPassword){
-      r.passwordHash = await hashPassword(r.__pendingPassword);
+      try{ await createLoginAccount_(r.username, r.name, 'reciter', r.id, r.__pendingPassword); }
+      catch(e){ errors.push(`تعذّر إنشاء حساب دخول للمقرئ "${r.name}" (${r.username}): ${e.message||e}`); }
       delete r.__pendingPassword;
     }
   }
@@ -2743,7 +2497,7 @@ function bindContentEvents(){
           const result = await processImportFile(uiState.importFileObj);
           uiState.importResult = result;
           if(result.saved===false){
-            uiState.importResult.errors = ['⚠️ تم استخراج البيانات من الملف بنجاح، لكن الحفظ في قاعدة البيانات فشل — قد تختفي هذه البيانات عند تحديث الصفحة. تحقق من الاتصال بقاعدة البيانات (وتأكد أن Apps Script محدَّث لآخر نسخة) ثم أعد الاستيراد.', ...uiState.importResult.errors];
+            uiState.importResult.errors = ['⚠️ تم استخراج البيانات من الملف بنجاح، لكن الحفظ في قاعدة البيانات فشل — قد تختفي هذه البيانات عند تحديث الصفحة. تحقق من اتصال الإنترنت ثم أعد الاستيراد.', ...uiState.importResult.errors];
           }else{
             showToast('اكتمل الاستيراد وحُفظ بنجاح: '+(result.reciters+result.circles+result.students)+' سجل');
           }
@@ -2897,8 +2651,13 @@ function bindContentEvents(){
       if(!name||!username||!email||!password){ addReciterError='يرجى تعبئة جميع الحقول'; render(); return; }
       if(DB.config.reciters.some(r=>r.username===username)){ addReciterError='اسم المستخدم هذا مستخدم بالفعل، اختر قيمة أخرى'; render(); return; }
       if(DB.config.reciters.some(r=>r.email===email)){ addReciterError='هذا البريد الإلكتروني مستخدم بالفعل، اختر بريدًا آخر'; render(); return; }
-      const passwordHash = await hashPassword(password);
-      DB.config.reciters.push({id:uid(), name, username, email, passwordHash});
+      const newId = uid();
+      try{
+        await createLoginAccount_(username, name, 'reciter', newId, password);
+      }catch(e){
+        addReciterError = 'تعذّر إنشاء حساب الدخول: ' + (e.message||e); render(); return;
+      }
+      DB.config.reciters.push({id:newId, name, username, email});
       await saveConfig(); showToast('تمت إضافة المقرئ'); render();
     }
     if(type==='reset-reciter-pw'){
@@ -2906,7 +2665,17 @@ function bindContentEvents(){
       const password = (fd.get('password')||'').toString();
       if(!password) return;
       const r = DB.config.reciters.find(x=>x.id===id);
-      if(r){ r.passwordHash = await hashPassword(password); await saveConfig(); showToast('تم تحديث كلمة المرور'); }
+      if(r){
+        // "تدوير الحساب": حساب Firebase Authentication لا يسمح لأي شخص (ولو مشرفًا) بتغيير كلمة
+        // مرور شخص آخر مباشرة من المتصفح، فننشئ حسابًا جديدًا كليًا بكلمة المرور الجديدة، ونُعيد
+        // توجيه دليل الدخول العام (login_lookup) إليه؛ الحساب القديم يبقى معلّقًا بلا ضرر ولا تكلفة.
+        try{
+          await createLoginAccount_(r.username, r.name, 'reciter', r.id, password);
+          showToast('تم تحديث كلمة المرور');
+        }catch(e){
+          showToast('تعذّر تحديث كلمة المرور: ' + (e.message||e));
+        }
+      }
       uiState.resettingReciter = null; render();
     }
     if(type==='add-examination'){
@@ -2932,12 +2701,17 @@ function bindContentEvents(){
       changePasswordError = ''; changePasswordSuccess = false;
       const account = session.role==='supervisor' ? getSupervisor(session.id) : getReciter(session.reciterId);
       if(!account){ changePasswordError='تعذّر إيجاد الحساب'; render(); return; }
-      const ok = await verifyPassword(currentPassword, account.passwordHash);
-      if(!ok){ changePasswordError='كلمة المرور الحالية غير صحيحة'; render(); return; }
       if(newPassword.length<4){ changePasswordError='كلمة المرور الجديدة قصيرة جدًا'; render(); return; }
       if(newPassword!==confirmPassword){ changePasswordError='كلمتا المرور الجديدتان غير متطابقتين'; render(); return; }
-      account.passwordHash = await hashPassword(newPassword);
-      await saveConfig();
+      try{
+        const user = fbAuth.currentUser;
+        const cred = EmailAuthProvider.credential(user.email, currentPassword);
+        await reauthenticateWithCredential(user, cred); // يتحقق من كلمة المرور الحالية فعليًا
+        await fbUpdatePassword(user, newPassword);
+      }catch(e){
+        changePasswordError = (e && e.code==='auth/invalid-credential') ? 'كلمة المرور الحالية غير صحيحة' : ('تعذّر تغيير كلمة المرور: ' + (e.message||e));
+        render(); return;
+      }
       changePasswordSuccess = true;
       render();
     }
@@ -2948,8 +2722,13 @@ function bindContentEvents(){
       addSupervisorError='';
       if(!name||!username||!password){ addSupervisorError='يرجى تعبئة جميع الحقول'; render(); return; }
       if(DB.config.supervisors.some(s=>s.username===username)){ addSupervisorError='هذا البريد الإلكتروني/اسم المستخدم مستخدم بالفعل، اختر قيمة أخرى'; render(); return; }
-      const passwordHash = await hashPassword(password);
-      DB.config.supervisors.push({id:uid(), name, username, passwordHash});
+      const newId = uid();
+      try{
+        await createLoginAccount_(username, name, 'supervisor', newId, password);
+      }catch(e){
+        addSupervisorError = 'تعذّر إنشاء حساب الدخول: ' + (e.message||e); render(); return;
+      }
+      DB.config.supervisors.push({id:newId, name, username});
       await saveConfig(); showToast('تمت إضافة حساب المشرف'); render();
     }
     if(type==='add-circle'){
