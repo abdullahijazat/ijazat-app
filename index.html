@@ -576,29 +576,37 @@ function randVersion_(){
 }
 
 async function apiGet(key){
+  const version = await apiGetRaw_(`${key}__current_version`);
+  if(version){
+    const chunksRaw = await apiGetRaw_(`${key}__v${version}__chunks`);
+    if(chunksRaw===undefined) throw new Error('critical_read_failure'); // إصدار موجود لكن عداده غائب = فشل حقيقي
+    const chunkCount = parseInt(chunksRaw||'0',10);
+    if(chunkCount<=0) return null;
+    const parts = await Promise.all(Array.from({length:chunkCount}, (_,i)=>apiGetRaw_(`${key}__v${version}__chunk_${i}`)));
+    if(parts.some(p=>p===undefined)) throw new Error('critical_read_failure'); // جزء متوقَّع غائب = فشل حقيقي، وليس "فارغ"
+    return JSON.parse(parts.join(''));
+  }
+  // توافق مع بيانات قديمة أُنشئت قبل هذا التحديث (نظام التجزئة السابق بدون إصدارات)
+  const legacyChunksRaw = await apiGetRaw_(key+'__chunks');
+  const legacyChunkCount = legacyChunksRaw? parseInt(legacyChunksRaw,10): 0;
+  if(legacyChunkCount>0){
+    const parts = await Promise.all(Array.from({length:legacyChunkCount}, (_,i)=>apiGetRaw_(`${key}__chunk_${i}`)));
+    if(parts.some(p=>p===undefined)) throw new Error('critical_read_failure');
+    return JSON.parse(parts.join(''));
+  }
+  const raw = await apiGetRaw_(key);
+  if(raw===undefined || raw==='') return null; // لا وجود لأي أثر لهذا المفتاح = فارغ فعليًا (وليس فشلاً)
+  return JSON.parse(raw);
+}
+// بديل احتياطي أبطأ لكن أكثر متانة: يجلب كل مفتاح على حدة بطلبات منفصلة (بدل طلب واحد ضخم)،
+// يُستخدم فقط لو تكرر فشل الطلب المُجمَّع — مفيد للحسابات الكبيرة جدًا (آلاف الطلاب) حيث قد
+// تكون الاستجابة المُجمَّعة الواحدة كبيرة جدًا وعرضة للاقتطاع الجزئي.
+async function apiGetAllViaIndividualKeys_(){
   try{
-    const version = await apiGetRaw_(`${key}__current_version`);
-    if(version){
-      const chunksRaw = await apiGetRaw_(`${key}__v${version}__chunks`);
-      const chunkCount = chunksRaw? parseInt(chunksRaw,10): 0;
-      if(chunkCount>0){
-        const parts = await Promise.all(Array.from({length:chunkCount}, (_,i)=>apiGetRaw_(`${key}__v${version}__chunk_${i}`)));
-        if(parts.some(p=>p===undefined)) return null;
-        return JSON.parse(parts.join(''));
-      }
-      return null;
-    }
-    // توافق مع بيانات قديمة أُنشئت قبل هذا التحديث (نظام التجزئة السابق بدون إصدارات)
-    const legacyChunksRaw = await apiGetRaw_(key+'__chunks');
-    const legacyChunkCount = legacyChunksRaw? parseInt(legacyChunksRaw,10): 0;
-    if(legacyChunkCount>0){
-      const parts = await Promise.all(Array.from({length:legacyChunkCount}, (_,i)=>apiGetRaw_(`${key}__chunk_${i}`)));
-      if(parts.some(p=>p===undefined)) return null;
-      return JSON.parse(parts.join(''));
-    }
-    const raw = await apiGetRaw_(key);
-    if(raw===undefined || raw==='') return null;
-    return JSON.parse(raw);
+    const [config, plans, attendance, harvest, examinations] = await Promise.all([
+      apiGet('config'), apiGet('plans'), apiGet('attendance'), apiGet('harvest'), apiGet('examinations')
+    ]);
+    return {config, plans, attendance, harvest, examinations};
   }catch(e){ return null; }
 }
 async function apiSet(key, value){
@@ -656,18 +664,23 @@ async function apiGetAllResolved_(){
   const data = await jsonpRetry_(u);
   if(!data || !data.ok) return null;
   const raw = data.data || {};
+  let hadCriticalFailure = false; // فشل حقيقي في التجميع (وليس "لا توجد بيانات أصلاً")
   function resolveKey(key){
     const version = raw[`${key}__current_version`];
     if(version){
-      const chunkCount = parseInt(raw[`${key}__v${version}__chunks`]||'0',10);
-      if(chunkCount<=0) return null;
+      const chunkCountRaw = raw[`${key}__v${version}__chunks`];
+      if(chunkCountRaw===undefined){ hadCriticalFailure = true; return null; } // يوجد إصدار لكن عداد أجزائه غائب — فشل قراءة حقيقي
+      const chunkCount = parseInt(chunkCountRaw||'0',10);
+      if(chunkCount<=0) return null; // فارغة فعليًا (0 عنصر)، وليست فشلاً
       const parts = [];
       for(let i=0;i<chunkCount;i++){
         const part = raw[`${key}__v${version}__chunk_${i}`];
-        if(part===undefined) return null;
+        // جزء متوقَّع لكنه غائب = فشل قراءة حقيقي (مثل استجابة كبيرة جدًا اقتُطعت جزئيًا)
+        // — لا نُعامله أبدًا كـ"لا توجد بيانات"، تجنّبًا لخطر الكتابة فوق بيانات حقيقية لاحقًا بقيمة فارغة
+        if(part===undefined){ hadCriticalFailure = true; return null; }
         parts.push(part);
       }
-      try{ return JSON.parse(parts.join('')); }catch(e){ return null; }
+      try{ return JSON.parse(parts.join('')); }catch(e){ hadCriticalFailure = true; return null; }
     }
     // توافق مع بيانات قديمة أُنشئت قبل نظام الإصدارات الذرّي
     const legacyChunkCount = parseInt(raw[`${key}__chunks`]||'0',10);
@@ -675,22 +688,26 @@ async function apiGetAllResolved_(){
       const parts = [];
       for(let i=0;i<legacyChunkCount;i++){
         const part = raw[`${key}__chunk_${i}`];
-        if(part===undefined) return null;
+        if(part===undefined){ hadCriticalFailure = true; return null; }
         parts.push(part);
       }
-      try{ return JSON.parse(parts.join('')); }catch(e){ return null; }
+      try{ return JSON.parse(parts.join('')); }catch(e){ hadCriticalFailure = true; return null; }
     }
     const plain = raw[key];
-    if(plain===undefined || plain==='') return null;
-    try{ return JSON.parse(plain); }catch(e){ return null; }
+    if(plain===undefined || plain==='') return null; // لا يوجد أي أثر لهذا المفتاح إطلاقًا = فارغ فعليًا
+    try{ return JSON.parse(plain); }catch(e){ hadCriticalFailure = true; return null; }
   }
-  return {
+  const resolved = {
     config: resolveKey('config'),
     plans: resolveKey('plans'),
     attendance: resolveKey('attendance'),
     harvest: resolveKey('harvest'),
     examinations: resolveKey('examinations'),
   };
+  // لو فشل تجميع أي مفتاح فشلاً حقيقيًا (وليس مجرد عدم وجوده)، نُرجع null بالكامل — هذا يجعل init()
+  // يتعامل معها كفشل اتصال يستحق إعادة المحاولة، بدل المتابعة ببيانات فارغة قد تُحفَظ لاحقًا بالخطأ
+  if(hadCriticalFailure) return null;
+  return resolved;
 }
 
 async function init(){
@@ -703,9 +720,14 @@ async function init(){
     resolved = await apiGetAllResolved_();
   }
   if(!resolved){
+    // فشل الطلب المُجمَّع (قد يكون بسبب حجم بيانات كبير جدًا اقتُطع جزئيًا) — نجرّب البديل
+    // الأبطأ لكن الأكثر متانة: جلب كل مفتاح على حدة بطلب منفصل، قبل الاستسلام نهائيًا
+    resolved = await apiGetAllViaIndividualKeys_();
+  }
+  if(!resolved){
     const ok = await apiTest();
     if(!ok){ apiConnectionError = true; ready = true; render(); return; }
-    resolved = await apiGetAllResolved_(); // نجح ping لكن فشلت القراءة، حاول أخيرة
+    resolved = await apiGetAllViaIndividualKeys_(); // نجح ping لكن فشلت القراءة، حاول أخيرة بالطريقة المتينة
   }
   if(!resolved){ apiConnectionError = true; ready = true; render(); return; }
   apiConnectionError = false;
@@ -1739,11 +1761,14 @@ async function processImportFile(file){
 
 // استيراد الطلاب الخاتمين سابقًا من إكسل: رقم تسلسلي — الاسم — رقم التسجيل — القراءة — تاريخ الختم.
 // يُطابق الطالب عبر رقم التسجيل إن وُجد؛ وإلا يُنشئ سجل طالب جديد باسمه فقط.
-async function processKhatmaImportFile(file){
+async function processKhatmaImportFile(file, circleId){
   const buf = await file.arrayBuffer();
   const wb = XLSX.read(buf, {type:'array'});
   const errors = [];
   let added = 0;
+
+  const circle = getCircle(circleId);
+  if(!circle){ errors.push('لم يتم اختيار حلقة صحيحة.'); return {added:0, errors}; }
 
   const sheetName = wb.SheetNames.find(n=>n.trim()==='الخاتمون') || wb.SheetNames[0];
   const ws = wb.Sheets[sheetName];
@@ -1761,12 +1786,17 @@ async function processKhatmaImportFile(file){
       student = {id:uid(), name, regNumber, nationality:'', enrollments:[]};
       DB.config.students.push(student);
     }
+    // نتأكد أن الطالب مسجّل فعليًا في الحلقة المختارة، حتى يظهر بشكل صحيح في صفحة ذلك المقرئ تحديدًا
+    student.enrollments = student.enrollments||[];
+    if(!student.enrollments.some(en=>en.circleId===circleId)){
+      student.enrollments.push({circleId, level:'', progress:'', qiraah, periodId:''});
+    }
     if(hasKhatmaFor(student, qiraah)){
       errors.push(`صف ${i+2}: "${name}" مسجّل خاتم بالفعل بنفس القراءة، تم التجاهل.`);
       return;
     }
     student.khatmaRecords = khatmaRecordsOf(student);
-    student.khatmaRecords.push({id:uid(), date:khatmaDate, qiraah, circleId:null});
+    student.khatmaRecords.push({id:uid(), date:khatmaDate, qiraah, circleId});
     delete student.khatmaDate; delete student.khatmaCircleId;
     added++;
   });
@@ -1867,14 +1897,22 @@ function tplKhatmeenSupervisor(){
 
   <div class="panel">
     <div class="panel-head"><h3>استيراد الخاتمين القدامى من إكسل</h3></div>
-    <div class="hint" style="text-align:right;margin:0 0 14px;">لإضافة دفعة من الطلاب الذين ختموا سابقًا قبل استخدام البرنامج. الأعمدة المطلوبة بالترتيب: رقم تسلسلي — الاسم — رقم التسجيل — القراءة — تاريخ الختم.</div>
+    <div class="hint" style="text-align:right;margin:0 0 14px;">لإضافة دفعة من الطلاب الذين ختموا سابقًا قبل استخدام البرنامج، لحلقة/مقرئ محدَّد تختاره أدناه. الأعمدة المطلوبة بالترتيب: رقم تسلسلي — الاسم — رقم التسجيل — القراءة — تاريخ الختم.</div>
+    <div class="field" style="max-width:420px;">
+      <label>الحلقة (المقرئ) المرتبطة بهذا الملف</label>
+      <select id="khatmaImportCircleSelect">
+        <option value="">— اختر الحلقة —</option>
+        ${DB.config.circles.map(c=>`<option value="${c.id}" ${uiState.khatmaImportCircleId===c.id?'selected':''}>${esc(circleLabel(c))}</option>`).join('')}
+      </select>
+    </div>
     <button class="btn btn-gold" data-action="download-khatma-template" type="button" style="margin-bottom:14px;">تنزيل نموذج إكسل فارغ</button>
     <div class="field">
       <label>اختر ملف الإكسل (.xlsx)</label>
       <input type="file" data-khatma-import-file accept=".xlsx,.xls">
       ${uiState.khatmaImportFileObj ? `<div class="hint" style="margin:6px 0 0;">الملف المختار: ${esc(uiState.khatmaImportFileObj.name)}</div>` : ''}
     </div>
-    <button class="btn btn-primary" data-action="run-khatma-import" type="button" ${(!uiState.khatmaImportFileObj || uiState.khatmaImporting)?'disabled':''}>${uiState.khatmaImporting?'جاري الاستيراد…':'بدء الاستيراد'}</button>
+    <button class="btn btn-primary" data-action="run-khatma-import" type="button" ${(!uiState.khatmaImportFileObj || !uiState.khatmaImportCircleId || uiState.khatmaImporting)?'disabled':''}>${uiState.khatmaImporting?'جاري الاستيراد…':'بدء الاستيراد'}</button>
+    ${!uiState.khatmaImportCircleId && uiState.khatmaImportFileObj ? `<div class="hint" style="margin-top:8px;color:var(--maroon);">يجب اختيار الحلقة أولاً قبل بدء الاستيراد.</div>` : ''}
     ${importResult ? `
     <div class="grid g-2" style="margin-top:14px;">
       <div class="stat-card"><div class="num">${importResult.added}</div><div class="lbl">ختمات أُضيفت</div></div>
@@ -2687,10 +2725,10 @@ function bindContentEvents(){
         }catch(err){ showToast('تعذر إنشاء النموذج'); }
       }
       if(action==='run-khatma-import'){
-        if(!uiState.khatmaImportFileObj || uiState.khatmaImporting) return;
+        if(!uiState.khatmaImportFileObj || !uiState.khatmaImportCircleId || uiState.khatmaImporting) return;
         uiState.khatmaImporting = true; render();
         try{
-          uiState.khatmaImportResult = await processKhatmaImportFile(uiState.khatmaImportFileObj);
+          uiState.khatmaImportResult = await processKhatmaImportFile(uiState.khatmaImportFileObj, uiState.khatmaImportCircleId);
         }catch(err){
           uiState.khatmaImportResult = {added:0, errors:['تعذّرت قراءة الملف. تأكد أنه بصيغة xlsx صحيحة.']};
         }
@@ -2798,6 +2836,11 @@ function bindContentEvents(){
     const khatmaImportFile = e.target.closest('[data-khatma-import-file]');
     if(khatmaImportFile){
       uiState.khatmaImportFileObj = khatmaImportFile.files && khatmaImportFile.files[0] ? khatmaImportFile.files[0] : null;
+      render(); return;
+    }
+    const khatmaCircleSelect = e.target.closest('#khatmaImportCircleSelect');
+    if(khatmaCircleSelect){
+      uiState.khatmaImportCircleId = khatmaCircleSelect.value || null;
       render(); return;
     }
   });
