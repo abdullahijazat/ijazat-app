@@ -2653,7 +2653,7 @@ function tplReciterPlans(){
   if(!circles.length) return `<div class="panel">${emptyState('لا توجد حلقة مرتبطة بك بعد','تواصل مع المشرف لإنشاء حلقتك.')}</div>`;
   ensureCtx();
   const ctx = uiState.sessCtx;
-  const students = ctx.circleId ? studentsOfCircle(ctx.circleId) : [];
+  const students = ctx.circleId ? studentsOfCircleAndPeriod(ctx.circleId, ctx.periodId) : [];
   const qiraahOptions = DB.config.qiraahOptions;
   const planTypes = DB.config.planTypes;
   const isToday = ctx.date===todayStr();
@@ -3368,7 +3368,7 @@ function bindContentEvents(){
     }
     if(type==='save-plans'){
       const ctx = uiState.sessCtx;
-      const students = studentsOfCircle(ctx.circleId);
+      const students = studentsOfCircleAndPeriod(ctx.circleId, ctx.periodId);
       let count=0;
       students.forEach(s=>{
         const qiraah = fd.get('qiraah_'+s.id) || '';
