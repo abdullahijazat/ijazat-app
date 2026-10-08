@@ -863,8 +863,9 @@ function khatmaRecordsOf(s){
   if(s.khatmaDate) return [{id:'legacy_'+s.id, date:s.khatmaDate, qiraah:'', circleId:s.khatmaCircleId||null}];
   return [];
 }
-function hasKhatmaFor(s, qiraah){
-  return khatmaRecordsOf(s).some(r=>(r.qiraah||'')===(qiraah||''));
+// tariq غير معطى => المطابقة بالقراءة فقط؛ معطى => بالقراءة والطريق معًا (يمكن لنفس الطالب أن يختم نفس القراءة بطريقين)
+function hasKhatmaFor(s, qiraah, tariq){
+  return khatmaRecordsOf(s).some(r=>(r.qiraah||'')===(qiraah||'') && (tariq===undefined || (r.tariq||'')===(tariq||'')));
 }
 function circlePeriodsLabel(c){ return (c.periodIds||[]).map(pid=>getPeriod(pid)?.name).filter(Boolean).join('، ') || '—'; }
 function absenceDaysCount(studentId, circleId){
@@ -1134,7 +1135,7 @@ function tplArchive(){
       <div style="margin-top:12px;text-align:right;">
         <div class="small"><b>الحلقات:</b> ${circles.length ? circles.map(c=>esc((c.circleName||'—')+(c.circleNumber?' ('+c.circleNumber+')':'')+' — '+(c.reciterName||'—'))).join(' ، ') : 'لا توجد'}</div>
         <div class="small" style="margin-top:6px;"><b>سجلات التحضير:</b> ${(a.attendanceRecords||[]).length} &nbsp; <b>الخطط:</b> ${(a.planRecords||[]).length} &nbsp; <b>الختمات:</b> ${khat.length}</div>
-        ${khat.length ? `<div class="small" style="margin-top:6px;">${khat.map(k=>esc((k.qiraah||'—')+' — '+fmtDual_(k.date||''))).join(' | ')}</div>` : ''}
+        ${khat.length ? `<div class="small" style="margin-top:6px;">${khat.map(k=>esc(qiraahTariqLabel_(k)+' — '+fmtDual_(k.date||''))).join(' | ')}</div>` : ''}
       </div>` : ''}
     </div>`;
   }).join('')}`;
@@ -1521,7 +1522,7 @@ function renderStudentCard(s, circles){
         <b>${esc(s.name)}</b>
         ${s.regNumber?`<span class="tag tag-neutral small">رقم ${esc(s.regNumber)}</span>`:''}
         ${s.nationality?`<span class="tag tag-neutral small">${esc(s.nationality)}</span>`:''}
-        ${khatmaList.map(k=>`<span class="tag tag-green small">خاتم${k.qiraah?' ('+esc(k.qiraah)+')':''} — ${esc(fmtDual_(k.date))}</span>`).join('')}
+        ${khatmaList.map(k=>`<span class="tag tag-green small">خاتم${k.qiraah?' ('+esc(k.qiraah)+(k.tariq?' — طريق '+esc(k.tariq):'')+')':''} — ${esc(fmtDual_(k.date))}</span>`).join('')}
         <span class="count-badge">${enrollments.length} حلقة</span>
       </div>
       <button class="btn btn-danger btn-sm" data-action="del-student" data-id="${s.id}">${uiState.confirmId==='student:'+s.id?'تأكيد الحذف؟':'حذف الطالب'}</button>
@@ -1806,52 +1807,26 @@ async function processImportFile(file, opts){
   return {reciters:addedReciters, circles:addedCircles, students:addedStudents, deletedStudents, errors, saved};
 }
 
-// استيراد الطلاب الخاتمين سابقًا من إكسل: رقم تسلسلي — الاسم — رقم التسجيل — القراءة — تاريخ الختم.
-// يُطابق الطالب عبر رقم التسجيل إن وُجد؛ وإلا يُنشئ سجل طالب جديد باسمه فقط.
-async function processKhatmaImportFile(file, circleId){
-  const buf = await file.arrayBuffer();
-  const wb = XLSX.read(buf, {type:'array'});
-  const errors = [];
-  let added = 0;
-
-  const circle = getCircle(circleId);
-  if(!circle){ errors.push('لم يتم اختيار حلقة صحيحة.'); return {added:0, errors}; }
-
-  const sheetName = wb.SheetNames.find(n=>n.trim()==='الخاتمون') || wb.SheetNames[0];
-  const ws = wb.Sheets[sheetName];
-  if(!ws){ errors.push('لم يتم العثور على أي ورقة في الملف.'); return {added:0, errors}; }
-  const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''}).slice(1).filter(r=>r.some(c=>String(c).trim()!==''));
-
-  rows.forEach((row, i)=>{
-    const name = (row[1]||'').toString().trim();
-    const regNumber = (row[2]||'').toString().trim();
-    const qiraah = (row[3]||'').toString().trim();
-    const khatmaDate = parseDateAny_(row[4]);
-    if(!name || !khatmaDate){ errors.push(`صف ${i+2}: بيانات ناقصة أو تاريخ الختم غير مفهوم (استخدم مثل 1446/03/15)، تم التجاهل.`); return; }
-    let student = regNumber ? DB.config.students.find(s=>s.regNumber===regNumber) : null;
-    if(!student){
-      student = {id:uid(), name, regNumber, nationality:'', enrollments:[]};
-      DB.config.students.push(student);
-    }
-    // نتأكد أن الطالب مسجّل فعليًا في الحلقة المختارة، حتى يظهر بشكل صحيح في صفحة ذلك المقرئ تحديدًا
-    student.enrollments = student.enrollments||[];
-    if(!student.enrollments.some(en=>en.circleId===circleId)){
-      student.enrollments.push({circleId, level:'', progress:'', qiraah, periodId:''});
-    }
-    if(hasKhatmaFor(student, qiraah)){
-      errors.push(`صف ${i+2}: "${name}" مسجّل خاتم بالفعل بنفس القراءة، تم التجاهل.`);
-      return;
-    }
-    student.khatmaRecords = khatmaRecordsOf(student);
-    student.khatmaRecords.push({id:uid(), date:khatmaDate, qiraah, circleId});
-    delete student.khatmaDate; delete student.khatmaCircleId;
-    added++;
+// أعمدة ملف الخاتمين تُعرَف من عناوينها (فيعمل الملف سواء وُجد عمود "الطريق" أم لا)؛ وإن لم تُفهم العناوين
+// تُستخدم الأماكن القديمة: رقم تسلسلي، الاسم، رقم التسجيل، القراءة، تاريخ الختم، اسم المقرئ.
+function khatmaCols_(headerRow){
+  const idx = { name:-1, reg:-1, nat:-1, qiraah:-1, tariq:-1, date:-1, sheikh:-1 };
+  (headerRow||[]).forEach((h,i)=>{
+    const t = looseArabic_(h);
+    if(!t) return;
+    if(idx.name<0 && (t==='الاسم' || t==='اسم' || t.includes('اسم الطالب'))) idx.name=i;
+    else if(idx.reg<0 && t.includes('رقم التسجيل')) idx.reg=i;
+    else if(idx.nat<0 && t.includes('جنسي')) idx.nat=i;
+    else if(idx.tariq<0 && t.includes('طريق')) idx.tariq=i;
+    else if(idx.qiraah<0 && (t.includes('القراءه') || t.includes('الرواي'))) idx.qiraah=i;
+    else if(idx.date<0 && t.includes('تاريخ')) idx.date=i;
+    else if(idx.sheikh<0 && (t.includes('المقرئ') || t.includes('الشيخ'))) idx.sheikh=i;
   });
-
-  if(added>0) await saveConfig();
-  return {added, errors};
+  if(idx.name<0 || idx.date<0) return { name:1, reg:2, nat:-1, qiraah:3, tariq:-1, date:4, sheikh:5 };
+  return idx;
 }
-
+const cell_ = (row, i) => (i>=0 && row[i]!=null) ? row[i] : '';
+const qiraahTariqLabel_ = k => (k.qiraah||'—') + (k.tariq ? ' — طريق ' + k.tariq : '');
 
 // ---- قوائم الخاتمين لكل مقرئ ----
 // الخاتم المرتبط بمقرئ (khatma.reciterId) يظهر لذلك المقرئ وحده؛ أما الخاتم القديم بلا reciterId فيظهر لمن
@@ -1907,14 +1882,18 @@ async function processKhatmaAllImportFile(file){
   };
   for(const sheetName of wb.SheetNames){
     const ws = wb.Sheets[sheetName];
-    const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''}).slice(1).filter(r=>r.some(c=>String(c).trim()!==''));
+    const allRows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
+    const cols = khatmaCols_(allRows[0]);
+    const rows = allRows.slice(1).filter(r=>r.some(c=>String(c).trim()!==''));
     rows.forEach((row,i)=>{
       const where = `${sheetName}، صف ${i+2}`;
-      const name = normName_(row[1]);
-      const regNumber = (row[2]||'').toString().trim();
-      const qiraah = (row[3]||'').toString().trim();
-      const date = parseDateAny_(row[4]);
-      const sheikhName = normName_(row[5]) || normName_(sheetName);
+      const name = normName_(cell_(row,cols.name));
+      const regNumber = (cell_(row,cols.reg)||'').toString().trim();
+      const qiraah = (cell_(row,cols.qiraah)||'').toString().trim();
+      const tariq = (cell_(row,cols.tariq)||'').toString().trim();
+      const nationality = (cell_(row,cols.nat)||'').toString().trim();
+      const date = parseDateAny_(cell_(row,cols.date));
+      const sheikhName = normName_(cell_(row,cols.sheikh)) || normName_(sheetName);
       if(!name || !date){ errors.push(`${where}: بيانات ناقصة أو تاريخ الختم غير مفهوم (استخدم مثل 1446/03/15)، تم التجاهل.`); return; }
       const fr = findReciter(sheikhName);
       if(!fr.r){
@@ -1923,15 +1902,15 @@ async function processKhatmaAllImportFile(file){
       }
       let student = findStudent(regNumber, name);
       if(!student){
-        student = { id:uid(), name, regNumber, nationality:'', enrollments:[], khatmaRecords:[] };
+        student = { id:uid(), name, regNumber, nationality, enrollments:[], khatmaRecords:[] };
         DB.config.students.push(student);
-      }
+      }else if(nationality && !student.nationality){ student.nationality = nationality; }
       const existing = khatmaRecordsOf(student);
-      if(existing.some(k=>(k.qiraah||'')===qiraah && (k.reciterId||'')===fr.r.id)){
-        errors.push(`${where}: "${name}" مسجّل خاتم بالفعل بنفس القراءة عند هذا المقرئ، تم التجاهل.`); return;
+      if(existing.some(k=>(k.qiraah||'')===qiraah && (k.tariq||'')===tariq && (k.reciterId||'')===fr.r.id)){
+        errors.push(`${where}: "${name}" مسجّل خاتم بالفعل بنفس القراءة والطريق عند هذا المقرئ، تم التجاهل.`); return;
       }
       student.khatmaRecords = existing;
-      student.khatmaRecords.push({ id:uid(), date, qiraah, circleId:null, reciterId:fr.r.id });
+      student.khatmaRecords.push({ id:uid(), date, qiraah, tariq, circleId:null, reciterId:fr.r.id });
       delete student.khatmaDate; delete student.khatmaCircleId;
       added++;
       perReciter.set(fr.r.name, (perReciter.get(fr.r.name)||0)+1);
@@ -1942,6 +1921,118 @@ async function processKhatmaAllImportFile(file){
   return { added, errors, saved, perReciter: Array.from(perReciter.entries()) };
 }
 
+
+// إحصائية الخاتمين: جدول متقاطع (الجنسية × القراءة) مع المجاميع، يُحسب من الصفوف المعطاة
+function khatmaStatsHtml_(rows, title){
+  if(!rows.length) return '';
+  const natOf = r => (r.student.nationality||'').toString().trim() || 'غير محددة';
+  const qOf = r => (r.khatma.qiraah||'').toString().trim() || 'غير محددة';
+  const nats = new Map(), qs = new Map(), cell = new Map();
+  rows.forEach(r=>{
+    const n=natOf(r), q=qOf(r);
+    nats.set(n,(nats.get(n)||0)+1); qs.set(q,(qs.get(q)||0)+1);
+    const key=n+'\u0001'+q; cell.set(key,(cell.get(key)||0)+1);
+  });
+  const natList = Array.from(nats.entries()).sort((a,b)=>b[1]-a[1]);
+  const qList = Array.from(qs.entries()).sort((a,b)=>b[1]-a[1]);
+  const distinctStudents = new Set(rows.map(r=>r.student.id)).size;
+  return `
+  <div class="panel">
+    <div class="panel-head"><h3>${esc(title||'إحصائية الخاتمين')}</h3><span class="count-badge">${rows.length} ختمة</span></div>
+    <div class="grid g-3" style="margin-bottom:14px;">
+      <div class="stat-card"><div class="num">${rows.length}</div><div class="lbl">إجمالي الختمات</div></div>
+      <div class="stat-card"><div class="num">${distinctStudents}</div><div class="lbl">عدد الطلاب الخاتمين</div></div>
+      <div class="stat-card"><div class="num">${natList.length}</div><div class="lbl">عدد الجنسيات</div></div>
+    </div>
+    <div style="overflow-x:auto;">
+    <table><thead><tr><th>الجنسية \\ القراءة</th>${qList.map(([q])=>`<th>${esc(q)}</th>`).join('')}<th>المجموع</th></tr></thead><tbody>
+      ${natList.map(([n,total])=>`<tr><td><b>${esc(n)}</b></td>${qList.map(([q])=>`<td class="muted">${cell.get(n+'\u0001'+q)||'—'}</td>`).join('')}<td><b>${total}</b></td></tr>`).join('')}
+      <tr><td><b>المجموع</b></td>${qList.map(([,c])=>`<td><b>${c}</b></td>`).join('')}<td><b>${rows.length}</b></td></tr>
+    </tbody></table>
+    </div>
+  </div>`;
+}
+
+
+const HIJRI_MONTHS_ = ['محرم','صفر','ربيع الأول','ربيع الآخر','جمادى الأولى','جمادى الآخرة','رجب','شعبان','رمضان','شوال','ذو القعدة','ذو الحجة'];
+const natLabel_ = r => (r.student.nationality||'').toString().trim() || 'غير محددة';
+const qLabel_ = r => (r.khatma.qiraah||'').toString().trim() || 'غير محددة';
+const tLabel_ = r => (r.khatma.tariq||'').toString().trim() || 'بدون طريق';
+
+// اسم المقرئ المرتبط بالختمة: المباشر، ثم مقرئ حلقة الختمة، ثم مقرئو حلقات الطالب
+function khatmaReciterName_(k, st){
+  if(k.reciterId){ const r=getReciter(k.reciterId); return r?r.name:'—'; }
+  const c = k.circleId ? getCircle(k.circleId) : null;
+  if(c){ const r=getReciter(c.reciterId); if(r) return r.name; }
+  const names = Array.from(new Set((st.enrollments||[]).map(en=>{ const cc=getCircle(en.circleId); const r=cc?getReciter(cc.reciterId):null; return r?r.name:null; }).filter(Boolean)));
+  return names.join('، ') || '—';
+}
+function allKhatmaRows_(){
+  const rows = [];
+  DB.config.students.forEach(st=> khatmaRecordsOf(st).forEach(k=> rows.push({student:st, khatma:k})));
+  rows.sort((a,b)=> (b.khatma.date||'').localeCompare(a.khatma.date||''));
+  return rows;
+}
+function khatmaFilteredRows_(allRows){
+  const f = uiState.khatmaFilter || {};
+  let rows = allRows;
+  if(f.reciter){ const mine = new Set(khatmaRowsForReciter_(f.reciter).map(r=>r.khatma.id)); rows = rows.filter(r=>mine.has(r.khatma.id)); }
+  if(f.qiraah) rows = rows.filter(r=>qLabel_(r)===f.qiraah);
+  if(f.tariq) rows = rows.filter(r=>tLabel_(r)===f.tariq);
+  if(f.nat) rows = rows.filter(r=>natLabel_(r)===f.nat);
+  const q = (f.q||'').trim().toLowerCase();
+  if(q) rows = rows.filter(r=>(r.student.name||'').toLowerCase().includes(q) || (r.student.regNumber||'').toLowerCase().includes(q));
+  return rows;
+}
+
+// إحصائيات إضافية: حسب المقرئ (للمشرف) وحسب الشهر الهجري
+function khatmaExtraStatsHtml_(rows, showReciters){
+  if(!rows.length) return '';
+  const byReciter = new Map(), byMonth = new Map(), byTariq = new Map();
+  rows.forEach(r=>{
+    const rn = khatmaReciterName_(r.khatma, r.student);
+    byReciter.set(rn,(byReciter.get(rn)||0)+1);
+    const t = tLabel_(r); byTariq.set(t,(byTariq.get(t)||0)+1);
+    const h = isoToHijri_(r.khatma.date);
+    const key = h ? `${h.y}-${String(h.m).padStart(2,'0')}` : 'غير معروف';
+    byMonth.set(key,(byMonth.get(key)||0)+1);
+  });
+  const monthRows = Array.from(byMonth.entries()).sort((a,b)=>b[0].localeCompare(a[0])).map(([k,c])=>{
+    const m=/^(\d{4})-(\d{2})$/.exec(k); return [m?`${HIJRI_MONTHS_[parseInt(m[2],10)-1]} ${m[1]} هـ`:k, c];
+  });
+  const tbl = (title, head, entries) => `
+    <div><h4 style="margin:0 0 8px;color:var(--primary-dark);">${title}</h4>
+    <table><thead><tr><th>${head}</th><th>عدد الختمات</th></tr></thead><tbody>
+      ${entries.map(([n,c])=>`<tr><td>${esc(n)}</td><td><b>${c}</b></td></tr>`).join('')}
+    </tbody></table></div>`;
+  const recEntries = Array.from(byReciter.entries()).sort((a,b)=>b[1]-a[1]);
+  const tarEntries = Array.from(byTariq.entries()).sort((a,b)=>b[1]-a[1]);
+  return `
+  <div class="panel">
+    <div class="panel-head"><h3>تفصيل إضافي</h3></div>
+    <div class="grid g-2">
+      ${showReciters ? tbl('حسب المقرئ','المقرئ',recEntries) : ''}
+      ${tbl('حسب الطريق','الطريق',tarEntries)}
+      ${tbl('حسب الشهر الهجري','الشهر',monthRows)}
+    </div>
+  </div>`;
+}
+
+function exportKhatmaExcel_(rows, baseName, withReciter){
+  if(!rows.length){ showToast('لا توجد ختمات للتصدير'); return; }
+  try{
+    const head = ['#','الاسم','رقم التسجيل','الجنسية','القراءة','الطريق','تاريخ الختم (هجري)','تاريخ الختم (ميلادي)'];
+    if(withReciter) head.push('المقرئ');
+    const data = [head, ...rows.map(({student:st,khatma:k},i)=>{
+      const row = [i+1, st.name||'', st.regNumber||'', st.nationality||'', k.qiraah||'', k.tariq||'', isoToHijri_(k.date)?fmtHijri_(k.date):(k.date||''), k.date||''];
+      if(withReciter) row.push(khatmaReciterName_(k, st));
+      return row;
+    })];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(data), 'الخاتمون');
+    XLSX.writeFile(wb, `${baseName}_${todayStr()}.xlsx`);
+  }catch(err){ showToast('تعذر إنشاء الملف'); }
+}
 
 function tplPlanOptions(){
   return `
@@ -2005,7 +2096,11 @@ function tplKhatmeenSupervisor(){
   });
   rows.sort((a,b)=> (b.khatma.date||'').localeCompare(a.khatma.date||''));
 
-  const importResult = uiState.khatmaImportResult;
+  const kf = uiState.khatmaFilter || {};
+  const fRows = khatmaFilteredRows_(rows);
+  const distinct = fn => Array.from(new Set(rows.map(fn))).sort((a,b)=>a.localeCompare(b,'ar'));
+  const qOpts = distinct(qLabel_), tOpts = distinct(tLabel_), nOpts = distinct(natLabel_);
+  const opts = (list, sel) => list.map(v=>`<option value="${esc(v)}" ${sel===v?'selected':''}>${esc(v)}</option>`).join('');
 
   return `
   <div class="panel">
@@ -2024,6 +2119,7 @@ function tplKhatmeenSupervisor(){
           <form data-form="set-khatma" class="form-row" style="align-items:end;margin:0;">
             <input type="hidden" name="studentId" value="${s.id}">
             <div class="field mb0"><select name="qiraah"><option value="">— القراءة —</option>${DB.config.qiraahOptions.map(qr=>`<option value="${esc(qr)}">${esc(qr)}</option>`).join('')}</select></div>
+            <div class="field mb0"><input type="text" name="tariq" placeholder="الطريق (اختياري)"></div>
             <div class="field mb0"><input type="text" name="khatmaDate" value="${esc(fmtHijri_(todayStr()).replace(' هـ',''))}" placeholder="تاريخ الختم هجري: 1446/03/15" inputmode="numeric" required></div>
             <div class="field mb0"><button class="btn btn-primary btn-sm" type="submit">تسجيل كخاتم</button></div>
           </form>
@@ -2035,7 +2131,7 @@ function tplKhatmeenSupervisor(){
   <div class="panel">
     <div class="panel-head"><h3>رفع قوائم الخاتمين لكل المقرئين (ملف واحد)</h3></div>
     <div class="hint" style="text-align:right;margin:0 0 14px;">
-      ملف إكسل واحد فيه كل المشايخ: الأعمدة بالترتيب — <b>رقم تسلسلي، الاسم، رقم التسجيل، القراءة، تاريخ الختم (هجري مثل 1446/03/15 — أو ميلادي، ويُحسب الآخر تلقائيًا)، اسم المقرئ</b>.
+      ملف إكسل واحد فيه كل المشايخ: الأعمدة بالترتيب — <b>رقم تسلسلي، الاسم، رقم التسجيل، الجنسية، القراءة، الطريق، تاريخ الختم (هجري مثل 1446/03/15 — أو ميلادي، ويُحسب الآخر تلقائيًا)، اسم المقرئ</b>.
       أو اجعل لكل مقرئ ورقة باسمه (بدون عمود المقرئ). يظهر الخاتمون في صفحة كل مقرئ وحده، دون إضافتهم إلى حلقته أو تحضيره.
     </div>
     <button class="btn btn-gold" data-action="download-khatma-all-template" type="button" style="margin-bottom:14px;">تنزيل نموذج إكسل</button>
@@ -2057,45 +2153,39 @@ function tplKhatmeenSupervisor(){
   </div>
 
   <div class="panel">
-    <div class="panel-head"><h3>استيراد الخاتمين القدامى من إكسل</h3></div>
-    <div class="hint" style="text-align:right;margin:0 0 14px;">لإضافة دفعة من الطلاب الذين ختموا سابقًا قبل استخدام البرنامج، لحلقة/مقرئ محدَّد تختاره أدناه. الأعمدة المطلوبة بالترتيب: رقم تسلسلي — الاسم — رقم التسجيل — القراءة — تاريخ الختم.</div>
-    <div class="field" style="max-width:420px;">
-      <label>الحلقة (المقرئ) المرتبطة بهذا الملف</label>
-      <select id="khatmaImportCircleSelect">
-        <option value="">— اختر الحلقة —</option>
-        ${DB.config.circles.map(c=>`<option value="${c.id}" ${uiState.khatmaImportCircleId===c.id?'selected':''}>${esc(circleLabel(c))}</option>`).join('')}
-      </select>
+    <div class="panel-head"><h3>تصفية الخاتمين وإحصائياتهم</h3><button class="btn btn-ghost btn-sm" data-action="reset-khatma-filter" type="button">إعادة ضبط</button></div>
+    <div class="grid g-3">
+      <div class="field"><label>المقرئ</label><select data-khatma-filter="reciter"><option value="">— الكل —</option>${DB.config.reciters.map(r=>`<option value="${r.id}" ${kf.reciter===r.id?'selected':''}>${esc(r.name)}</option>`).join('')}</select></div>
+      <div class="field"><label>القراءة</label><select data-khatma-filter="qiraah"><option value="">— الكل —</option>${opts(qOpts, kf.qiraah)}</select></div>
+      <div class="field"><label>الطريق</label><select data-khatma-filter="tariq"><option value="">— الكل —</option>${opts(tOpts, kf.tariq)}</select></div>
+      <div class="field"><label>الجنسية</label><select data-khatma-filter="nat"><option value="">— الكل —</option>${opts(nOpts, kf.nat)}</select></div>
+      <div class="field" style="grid-column: span 2;"><label>بحث بالاسم أو رقم التسجيل</label><input type="text" id="khatmaListSearchInput" value="${esc(kf.q||'')}" placeholder="اكتب للبحث..."></div>
     </div>
-    <button class="btn btn-gold" data-action="download-khatma-template" type="button" style="margin-bottom:14px;">تنزيل نموذج إكسل فارغ</button>
-    <div class="field">
-      <label>اختر ملف الإكسل (.xlsx)</label>
-      <input type="file" data-khatma-import-file accept=".xlsx,.xls">
-      ${uiState.khatmaImportFileObj ? `<div class="hint" style="margin:6px 0 0;">الملف المختار: ${esc(uiState.khatmaImportFileObj.name)}</div>` : ''}
-    </div>
-    <button class="btn btn-primary" data-action="run-khatma-import" type="button" ${(!uiState.khatmaImportFileObj || !uiState.khatmaImportCircleId || uiState.khatmaImporting)?'disabled':''}>${uiState.khatmaImporting?'جاري الاستيراد…':'بدء الاستيراد'}</button>
-    ${!uiState.khatmaImportCircleId && uiState.khatmaImportFileObj ? `<div class="hint" style="margin-top:8px;color:var(--maroon);">يجب اختيار الحلقة أولاً قبل بدء الاستيراد.</div>` : ''}
-    ${importResult ? `
-    <div class="grid g-2" style="margin-top:14px;">
-      <div class="stat-card"><div class="num">${importResult.added}</div><div class="lbl">ختمات أُضيفت</div></div>
-      <div class="stat-card"><div class="num">${importResult.errors.length}</div><div class="lbl">ملاحظات</div></div>
-    </div>
-    ${importResult.errors.length ? `<div class="error-box" style="text-align:right;margin-top:10px;"><ul style="margin:0;padding-inline-start:18px;">${importResult.errors.map(e=>`<li>${esc(e)}</li>`).join('')}</ul></div>` : ''}
-    ` : ''}
   </div>
+  ${khatmaStatsHtml_(fRows, 'إحصائية الخاتمين (حسب التصفية) — الجنسية × القراءة')}
+  ${khatmaExtraStatsHtml_(fRows, !kf.reciter)}
 
   <div class="panel">
-    <div class="panel-head"><h3>قائمة الختمات المسجّلة</h3><span class="count-badge">${rows.length}</span></div>
-    ${!rows.length ? emptyState('لا توجد ختمات مسجّلة بعد','') : `
-    <table><thead><tr><th>الاسم</th><th>رقم التسجيل</th><th>الجنسية</th><th>القراءة</th><th>تاريخ الختم</th><th></th></tr></thead><tbody>
-      ${rows.map(({student:s,khatma:k})=>`<tr>
+    <div class="panel-head"><h3>قائمة الختمات المسجّلة</h3><span class="count-badge">${fRows.length}${fRows.length!==rows.length?' من '+rows.length:''}</span></div>
+    ${!fRows.length ? emptyState(rows.length?'لا توجد نتائج مطابقة للتصفية':'لا توجد ختمات مسجّلة بعد','') : `
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
+      <button class="btn btn-gold btn-sm" data-action="export-khatma-sup" type="button">تصدير Excel</button>
+      <button class="btn btn-gold btn-sm" data-action="print-khatma-sup" type="button">طباعة / PDF</button>
+    </div>
+    <div style="overflow-x:auto;">
+    <table><thead><tr><th>الاسم</th><th>رقم التسجيل</th><th>الجنسية</th><th>القراءة</th><th>الطريق</th><th>تاريخ الختم</th><th>المقرئ</th><th></th></tr></thead><tbody>
+      ${fRows.slice(0,500).map(({student:s,khatma:k})=>`<tr>
           <td><b>${esc(s.name)}</b></td>
           <td class="muted small">${esc(s.regNumber||'—')}</td>
           <td class="muted small">${esc(s.nationality||'—')}</td>
           <td class="muted small">${esc(k.qiraah||'—')}</td>
+          <td class="muted small">${esc(k.tariq||'—')}</td>
           <td class="muted">${esc(fmtDual_(k.date))}</td>
+          <td class="muted small">${esc(khatmaReciterName_(k,s))}</td>
           <td><button class="btn btn-ghost btn-sm" data-action="unset-khatma" data-sid="${s.id}" data-kid="${k.id}">إزالة</button></td>
         </tr>`).join('')}
-    </tbody></table>`}
+    </tbody></table></div>
+    ${fRows.length>500?`<div class="hint" style="margin-top:8px;">يُعرض أول 500 سجل من ${fRows.length}. استخدم التصفية أو التصدير لرؤية الباقي.</div>`:''}`}
   </div>`;
 }
 
@@ -2368,19 +2458,22 @@ function tplKhatmeenReciter(){
   const rows = khatmaRowsForReciter_(session.reciterId);
 
   return `
+  ${khatmaStatsHtml_(rows, 'إحصائية الخاتمين عندي — حسب القراءة والجنسية')}
+  ${khatmaExtraStatsHtml_(rows, false)}
   <div class="panel">
     <div class="panel-head"><h3>الطلاب الخاتمون</h3><span class="count-badge">${rows.length}</span></div>
     <div class="hint" style="margin:0 0 14px;">تُضاف هذه القائمة تلقائيًا عند تسجيل آخر صفحة في المصحف (${TOTAL_MUSHAF_PAGES}) لأي طالب من "التحضير" (ختمة جديدة تُحتسب لكل قراءة مختلفة)، أو يدويًا من قبل المشرف.</div>
     ${!rows.length ? emptyState('لا يوجد طلاب خاتمون بعد','') : `
     <button class="btn btn-gold" data-action="print-khatmeen" style="margin-bottom:14px;">تحميل القائمة PDF</button>
-    <table><thead><tr><th>#</th><th>الاسم</th><th>رقم التسجيل</th><th>الجنسية</th><th>القراءة</th><th>تاريخ الختم</th></tr></thead><tbody>
-      ${rows.map(({student:s,khatma:k},i)=>`<tr><td class="muted">${i+1}</td><td><b>${esc(s.name)}</b></td><td class="muted">${esc(s.regNumber||'—')}</td><td class="muted">${esc(s.nationality||'—')}</td><td class="muted">${esc(k.qiraah||'—')}</td><td class="muted">${esc(fmtDual_(k.date))}</td></tr>`).join('')}
+    <button class="btn btn-gold" data-action="export-khatma-rec" style="margin-bottom:14px;">تصدير Excel</button>
+    <table><thead><tr><th>#</th><th>الاسم</th><th>رقم التسجيل</th><th>الجنسية</th><th>القراءة</th><th>الطريق</th><th>تاريخ الختم</th></tr></thead><tbody>
+      ${rows.map(({student:s,khatma:k},i)=>`<tr><td class="muted">${i+1}</td><td><b>${esc(s.name)}</b></td><td class="muted">${esc(s.regNumber||'—')}</td><td class="muted">${esc(s.nationality||'—')}</td><td class="muted">${esc(k.qiraah||'—')}</td><td class="muted">${esc(k.tariq||'—')}</td><td class="muted">${esc(fmtDual_(k.date))}</td></tr>`).join('')}
     </tbody></table>`}
   </div>`;
 }
 
-function printKhatmeenList(rows){
-  const rowsHtml = rows.map(({student:s,khatma:k},i)=>`<tr><td>${i+1}</td><td>${esc(s.name)}</td><td>${esc(s.regNumber||'—')}</td><td>${esc(s.nationality||'—')}</td><td>${esc(k.qiraah||'—')}</td><td>${esc(k.date?fmtDual_(k.date):'—')}</td></tr>`).join('');
+function printKhatmeenList(rows, withReciter){
+  const rowsHtml = rows.map(({student:s,khatma:k},i)=>`<tr><td>${i+1}</td><td>${esc(s.name)}</td><td>${esc(s.regNumber||'—')}</td><td>${esc(s.nationality||'—')}</td><td>${esc(k.qiraah||'—')}</td><td>${esc(k.tariq||'—')}</td><td>${esc(k.date?fmtDual_(k.date):'—')}</td>${withReciter?`<td>${esc(khatmaReciterName_(k,s))}</td>`:''}</tr>`).join('');
   const win = window.open('', '_blank');
   if(!win) { showToast('يرجى السماح بالنوافذ المنبثقة لتحميل الملف'); return; }
   win.document.write(`<!DOCTYPE html><html dir="rtl" lang="ar"><head><meta charset="UTF-8"><title>الطلاب الخاتمون</title>
@@ -2396,7 +2489,7 @@ function printKhatmeenList(rows){
   </style></head><body>
   <h1>شعبة إجازات القرآن الكريم</h1>
   <p class="sub">قائمة الطلاب الخاتمين — بتاريخ ${esc(todayStr())}</p>
-  <table><thead><tr><th>#</th><th>الاسم</th><th>رقم التسجيل</th><th>الجنسية</th><th>القراءة</th><th>تاريخ الختم</th></tr></thead><tbody>${rowsHtml}</tbody></table>
+  <table><thead><tr><th>#</th><th>الاسم</th><th>رقم التسجيل</th><th>الجنسية</th><th>القراءة</th><th>الطريق</th><th>تاريخ الختم</th>${withReciter?'<th>المقرئ</th>':''}</tr></thead><tbody>${rowsHtml}</tbody></table>
   </body></html>`);
   win.document.close();
   win.focus();
@@ -2887,28 +2980,21 @@ function bindContentEvents(){
           XLSX.writeFile(wb, 'نموذج_استيراد_شعبة_الإجازات.xlsx');
         }catch(err){ showToast('تعذر إنشاء النموذج'); }
       }
-      if(action==='download-khatma-template'){
-        try{
-          const wb = XLSX.utils.book_new();
-          const ws = XLSX.utils.aoa_to_sheet([
-            ['رقم تسلسلي','الاسم','رقم التسجيل','القراءة','تاريخ الختم'],
-            ['1','مثال: عبدالله أحمد','10023','حفص عن عاصم','1445/11/02']
-          ]);
-          XLSX.utils.book_append_sheet(wb, ws, 'الخاتمون');
-          XLSX.writeFile(wb, 'نموذج_استيراد_الخاتمين.xlsx');
-        }catch(err){ showToast('تعذر إنشاء النموذج'); }
-      }
       if(action==='download-khatma-all-template'){
         try{
           const wb = XLSX.utils.book_new();
           const ws = XLSX.utils.aoa_to_sheet([
-            ['رقم تسلسلي','الاسم','رقم التسجيل','القراءة','تاريخ الختم','اسم المقرئ'],
-            ['1','مثال: عبدالله أحمد','S1813514','حفص عن عاصم','1445/11/02','اسم المقرئ كما في البرنامج']
+            ['رقم تسلسلي','الاسم','رقم التسجيل','الجنسية','القراءة','الطريق','تاريخ الختم','اسم المقرئ'],
+            ['1','مثال: عبدالله أحمد','S1813514','السودان','حفص عن عاصم','الشاطبية','1445/11/02','اسم المقرئ كما في البرنامج']
           ]);
           XLSX.utils.book_append_sheet(wb, ws, 'الخاتمون');
           XLSX.writeFile(wb, 'نموذج_الخاتمين_لكل_المقرئين.xlsx');
         }catch(err){ showToast('تعذر إنشاء النموذج'); }
       }
+      if(action==='reset-khatma-filter'){ uiState.khatmaFilter = {}; render(); }
+      if(action==='export-khatma-sup'){ exportKhatmaExcel_(khatmaFilteredRows_(allKhatmaRows_()), 'الخاتمون', true); }
+      if(action==='print-khatma-sup'){ printKhatmeenList(khatmaFilteredRows_(allKhatmaRows_()), true); }
+      if(action==='export-khatma-rec'){ exportKhatmaExcel_(khatmaRowsForReciter_(session.reciterId), 'خاتمو_حلقتي', false); }
       if(action==='run-khatma-all-import'){
         if(!uiState.khatmaAllFileObj || uiState.khatmaAllImporting) return;
         uiState.khatmaAllImporting = true; render();
@@ -2919,18 +3005,6 @@ function bindContentEvents(){
         }
         uiState.khatmaAllImporting = false;
         uiState.khatmaAllFileObj = null;
-        render();
-      }
-      if(action==='run-khatma-import'){
-        if(!uiState.khatmaImportFileObj || !uiState.khatmaImportCircleId || uiState.khatmaImporting) return;
-        uiState.khatmaImporting = true; render();
-        try{
-          uiState.khatmaImportResult = await processKhatmaImportFile(uiState.khatmaImportFileObj, uiState.khatmaImportCircleId);
-        }catch(err){
-          uiState.khatmaImportResult = {added:0, errors:['تعذّرت قراءة الملف. تأكد أنه بصيغة xlsx صحيحة.']};
-        }
-        uiState.khatmaImporting = false;
-        uiState.khatmaImportFileObj = null;
         render();
       }
       if(action==='run-import'){
@@ -3044,14 +3118,9 @@ function bindContentEvents(){
       uiState.khatmaAllFileObj = khatmaAllFile.files && khatmaAllFile.files[0] ? khatmaAllFile.files[0] : null;
       render(); return;
     }
-    const khatmaImportFile = e.target.closest('[data-khatma-import-file]');
-    if(khatmaImportFile){
-      uiState.khatmaImportFileObj = khatmaImportFile.files && khatmaImportFile.files[0] ? khatmaImportFile.files[0] : null;
-      render(); return;
-    }
-    const khatmaCircleSelect = e.target.closest('#khatmaImportCircleSelect');
-    if(khatmaCircleSelect){
-      uiState.khatmaImportCircleId = khatmaCircleSelect.value || null;
+    const kFilter = e.target.closest('[data-khatma-filter]');
+    if(kFilter){
+      uiState.khatmaFilter = Object.assign({}, uiState.khatmaFilter||{}, { [kFilter.dataset.khatmaFilter]: kFilter.value || '' });
       render(); return;
     }
   });
@@ -3071,6 +3140,15 @@ function bindContentEvents(){
       render();
       const newInput = document.getElementById('studentSearchInput');
       if(newInput){ newInput.focus(); newInput.setSelectionRange(cursorPos, cursorPos); }
+      return;
+    }
+    const kListSearch = e.target.closest('#khatmaListSearchInput');
+    if(kListSearch){
+      uiState.khatmaFilter = Object.assign({}, uiState.khatmaFilter||{}, { q: kListSearch.value });
+      const cp = kListSearch.selectionStart;
+      render();
+      const ni = document.getElementById('khatmaListSearchInput');
+      if(ni){ ni.focus(); ni.setSelectionRange(cp, cp); }
       return;
     }
     const archSearch = e.target.closest('#archiveSearchInput');
@@ -3234,13 +3312,14 @@ function bindContentEvents(){
       const khatmaDate=parseDateAny_(fd.get('khatmaDate'));
       if(!khatmaDate){ showToast('تاريخ الختم غير مفهوم — اكتبه هكذا: 1446/03/15'); return; }
       const qiraah=(fd.get('qiraah')||'').toString().trim();
+      const tariq=(fd.get('tariq')||'').toString().trim();
       const s = getStudent(studentId);
       if(s && khatmaDate){
-        if(hasKhatmaFor(s, qiraah)){
-          showToast('الطالب مسجّل خاتم بالفعل بهذه القراءة');
+        if(hasKhatmaFor(s, qiraah, tariq)){
+          showToast('الطالب مسجّل خاتم بالفعل بهذه القراءة والطريق');
         }else{
           s.khatmaRecords = khatmaRecordsOf(s);
-          s.khatmaRecords.push({id:uid(), date:khatmaDate, qiraah, circleId:null});
+          s.khatmaRecords.push({id:uid(), date:khatmaDate, qiraah, tariq, circleId:null});
           delete s.khatmaDate; delete s.khatmaCircleId;
           await saveConfig(); showToast('تم تسجيل الطالب كخاتم');
         }
