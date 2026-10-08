@@ -328,7 +328,7 @@ import {
   reauthenticateWithCredential, EmailAuthProvider, onAuthStateChanged
 } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-auth.js";
 import {
-  getFirestore, collection, doc, getDoc, getDocs, setDoc, deleteDoc, writeBatch
+  getFirestore, collection, doc, getDoc, getDocs, setDoc, deleteDoc, writeBatch, query, where
 } from "https://www.gstatic.com/firebasejs/12.19.0/firebase-firestore.js";
 
 /* =======================================================================
@@ -495,7 +495,62 @@ function showToast(msg){
 // آلاف الطلاب)، نحتفظ بنسخة من آخر حالة "تمت مزامنتها بنجاح" لكل مجموعة، ونحسب فقط الفرق
 // الحقيقي (إضافة/تعديل/حذف)، ثم نكتب هذا الفرق فقط، على دفعات لا تتجاوز 450 عملية للدفعة
 // (الحد الفعلي لفايرستور هو 500 عملية في كل دفعة واحدة).
-let lastSynced = { reciters:[], circles:[], students:[], supervisors:[], plans:[], attendance:[], harvest:[], examinations:[], archive:[], settings:null };
+let lastSynced = { reciters:[], circles:[], students:[], supervisors:[], examinations:[], archive:[], settings:null };
+
+/* ---------------- تخزين التحضير/الخطط/الحصاد على شكل "حزم" (لتوفير القراءات) ----------------
+   بدل مستند لكل سجل (قد يصل لمئات الآلاف)، تُجمَع السجلات في مستند لكل (حلقة، نصف شهر).
+   في الذاكرة تبقى DB.attendance/plans/harvest مصفوفات عادية كما كانت، فلا يتغير بقية الكود. */
+const BUCKETED = { attendance:'attendance_m', plans:'plans_m', harvest:'harvest_m' };
+let lastBuckets = { attendance:new Map(), plans:new Map(), harvest:new Map() };
+
+function bucketKeyOf_(item){
+  const d = (item.date||'').toString();
+  const month = d.slice(0,7) || 'undated';
+  const half = (parseInt(d.slice(8,10),10)||1) <= 15 ? 'a' : 'b';
+  return `${item.circleId||'nocircle'}_${month}_${half}`;
+}
+function reciterOfCircle_(circleId){ const c = DB.config.circles.find(x=>x.id===circleId); return c ? (c.reciterId||'') : ''; }
+function bucketize_(items){
+  const m = new Map();
+  (items||[]).forEach(it=>{
+    const k = bucketKeyOf_(it);
+    if(!m.has(k)) m.set(k, { circleId: it.circleId||'', month: (it.date||'').toString().slice(0,7), reciterId: reciterOfCircle_(it.circleId), records: [] });
+    m.get(k).records.push(it);
+  });
+  m.forEach(b=> b.records.sort((x,y)=> (x.id<y.id?-1:(x.id>y.id?1:0))));
+  return m;
+}
+function bucketSignature_(b){ return JSON.stringify({ r:b.reciterId, records:b.records }); }
+function snapshotBuckets_(name, items){
+  const sig = new Map();
+  bucketize_(items).forEach((b,k)=> sig.set(k, bucketSignature_(b)));
+  lastBuckets[name] = sig;
+}
+async function syncBucketed_(name, current){
+  try{
+    const coll = BUCKETED[name];
+    const cur = bucketize_(current);
+    const prev = lastBuckets[name];
+    const ops = []; const next = new Map();
+    for(const [k,b] of cur){
+      const sig = bucketSignature_(b); next.set(k, sig);
+      if(prev.get(k)!==sig){
+        ops.push({ type:'set', ref: doc(fsDB, coll, k), data: { circleId:b.circleId, month:b.month, reciterId:b.reciterId, records: JSON.parse(JSON.stringify(b.records)) } });
+      }
+    }
+    for(const k of prev.keys()){ if(!cur.has(k)) ops.push({ type:'delete', ref: doc(fsDB, coll, k) }); }
+    if(ops.length) await commitOps_(ops);
+    lastBuckets[name] = next;
+    return true;
+  }catch(e){ return false; }
+}
+async function fetchBuckets_(name, reciterId){
+  const base = collection(fsDB, BUCKETED[name]);
+  const snap = await getDocs(reciterId ? query(base, where('reciterId','==',reciterId)) : base);
+  const out = [];
+  snap.forEach(d=>{ const recs = (d.data().records)||[]; recs.forEach(r=>out.push(r)); });
+  return out;
+}
 
 function cloneDeep_(v){ return v===undefined ? v : JSON.parse(JSON.stringify(v)); }
 
@@ -545,7 +600,17 @@ async function fetchCollection_(name){
 }
 
 /* ---------------- دوال الحفظ (نفس الاسم والتوقيع المستخدم في كل الكود الحالي) ---------------- */
+// تحديث الحقل المساعد reciterIds في كل طالب (معرّفات مقرئي حلقاته) — هو ما يقرأ المقرئ طلابه به.
+function computeReciterIds_(){
+  let changed = 0;
+  DB.config.students.forEach(st=>{
+    const ids = Array.from(new Set((st.enrollments||[]).map(en=>reciterOfCircle_(en.circleId)).filter(Boolean))).sort();
+    if(JSON.stringify(ids)!==JSON.stringify(st.reciterIds||null)){ st.reciterIds = ids; changed++; }
+  });
+  return changed;
+}
 async function saveConfig(){
+  if(session && session.role==='supervisor') computeReciterIds_();
   const okReciters = await syncArrayCollection_('reciters', DB.config.reciters, 'reciters');
   const okCircles = await syncArrayCollection_('circles', DB.config.circles, 'circles');
   const okStudents = await syncArrayCollection_('students', DB.config.students, 'students');
@@ -560,9 +625,9 @@ async function saveConfig(){
   if(!ok) showToast('تعذر الحفظ في قاعدة البيانات، تحقق من الاتصال');
   return ok;
 }
-async function savePlans(){ const ok = await syncArrayCollection_('plans', DB.plans, 'plans'); if(!ok) showToast('تعذر حفظ الخطط، تحقق من الاتصال'); return ok; }
-async function saveAttendance(){ const ok = await syncArrayCollection_('attendance', DB.attendance, 'attendance'); if(!ok) showToast('تعذر حفظ التحضير، تحقق من الاتصال'); return ok; }
-async function saveHarvest(){ const ok = await syncArrayCollection_('harvest', DB.harvest, 'harvest'); if(!ok) showToast('تعذر حفظ الحصاد، تحقق من الاتصال'); return ok; }
+async function savePlans(){ const ok = await syncBucketed_('plans', DB.plans); if(!ok) showToast('تعذر حفظ الخطط، تحقق من الاتصال'); return ok; }
+async function saveAttendance(){ const ok = await syncBucketed_('attendance', DB.attendance); if(!ok) showToast('تعذر حفظ التحضير، تحقق من الاتصال'); return ok; }
+async function saveHarvest(){ const ok = await syncBucketed_('harvest', DB.harvest); if(!ok) showToast('تعذر حفظ الحصاد، تحقق من الاتصال'); return ok; }
 async function saveExaminations(){ const ok = await syncArrayCollection_('examinations', DB.examinations, 'examinations'); if(!ok) showToast('تعذر حفظ بيانات لجنة الاختبار، تحقق من الاتصال'); return ok; }
 // Firebase Authentication يحفظ جلسة الدخول تلقائيًا وبأمان (IndexedDB) — لا حاجة لأي حفظ يدوي هنا.
 // الدالة باقية فقط حتى لا نحتاج لتعديل كل موضع استدعاء لها في بقية الكود.
@@ -621,13 +686,30 @@ async function restoreFromArchive_(archiveId){
 let dataFullyLoaded = false;
 
 /* ---------------- تحميل كل البيانات من Firestore بعد نجاح تسجيل الدخول ---------------- */
-async function loadAllData_(role){
-  const [reciters, circles, students, supervisors, plans, attendance, harvest, examinations, settingsSnap, archive] = await Promise.all([
-    fetchCollection_('reciters'), fetchCollection_('circles'), fetchCollection_('students'), fetchCollection_('supervisors'),
-    fetchCollection_('plans'), fetchCollection_('attendance'), fetchCollection_('harvest'), fetchCollection_('examinations'),
-    getDoc(doc(fsDB,'settings','general')),
-    role==='supervisor' ? fetchCollection_('archive') : Promise.resolve([])
-  ]);
+async function loadAllData_(role, refId){
+  let reciters, circles, students, supervisors = [], plans, attendance, harvest, examinations = [], archive = [], settingsSnap;
+  if(role==='supervisor'){
+    [reciters, circles, students, supervisors, plans, attendance, harvest, examinations, archive, settingsSnap] = await Promise.all([
+      fetchCollection_('reciters'), fetchCollection_('circles'), fetchCollection_('students'), fetchCollection_('supervisors'),
+      fetchBuckets_('plans'), fetchBuckets_('attendance'), fetchBuckets_('harvest'),
+      fetchCollection_('examinations'), fetchCollection_('archive'),
+      getDoc(doc(fsDB,'settings','general'))
+    ]);
+  }else{
+    // المقرئ: بياناته وحلقاته وطلاب حلقاته فقط (يوفّر القراءات المجانية ويحمي خصوصية بقية البيانات)
+    const rSnap = await getDoc(doc(fsDB,'reciters',refId));
+    reciters = rSnap.exists() ? [{ id:rSnap.id, ...rSnap.data() }] : [];
+    const isExaminer = !!(reciters[0] && reciters[0].isExaminer);
+    const col = n => collection(fsDB, n);
+    const rows = async q => { const sn = await getDocs(q); const o=[]; sn.forEach(d=>o.push({id:d.id, ...d.data()})); return o; };
+    [circles, students, plans, attendance, harvest, examinations, settingsSnap] = await Promise.all([
+      rows(query(col('circles'), where('reciterId','==',refId))),
+      rows(query(col('students'), where('reciterIds','array-contains',refId))),
+      fetchBuckets_('plans', refId), fetchBuckets_('attendance', refId), fetchBuckets_('harvest', refId),
+      isExaminer ? fetchCollection_('examinations') : Promise.resolve([]),
+      getDoc(doc(fsDB,'settings','general'))
+    ]);
+  }
   const settings = settingsSnap.exists() ? settingsSnap.data() : {};
   DB.config = {
     reciters, circles, students, supervisors,
@@ -638,10 +720,29 @@ async function loadAllData_(role){
 
   lastSynced = {
     reciters: cloneDeep_(reciters), circles: cloneDeep_(circles), students: cloneDeep_(students), supervisors: cloneDeep_(supervisors),
-    plans: cloneDeep_(plans), attendance: cloneDeep_(attendance), harvest: cloneDeep_(harvest), examinations: cloneDeep_(examinations), archive: cloneDeep_(archive),
+    examinations: cloneDeep_(examinations), archive: cloneDeep_(archive),
     settings: cloneDeep_({ qiraahOptions: DB.config.qiraahOptions, planTypes: DB.config.planTypes }),
   };
+  snapshotBuckets_('plans', plans); snapshotBuckets_('attendance', attendance); snapshotBuckets_('harvest', harvest);
   dataFullyLoaded = true;
+}
+
+// للمشرف فقط، بعد التحميل: (1) نقل التحضير/الخطط/الحصاد القديمة (سجل لكل مستند) إلى نظام الحزم،
+// (2) تعبئة الحقل المساعد reciterIds للطلاب (مرة واحدة فقط)، ليتمكن كل مقرئ من قراءة طلاب حلقاته.
+async function supervisorMaintenance_(){
+  try{
+    for(const name of ['attendance','plans','harvest']){
+      const legacy = await fetchCollection_(name);
+      if(!legacy.length) continue;
+      const have = new Set(DB[name].map(x=>x.id));
+      legacy.forEach(r=>{ if(!have.has(r.id)) DB[name].push(r); });
+      const ok = await syncBucketed_(name, DB[name]);
+      if(ok){
+        await commitOps_(legacy.map(r=>({ type:'delete', ref: doc(fsDB, name, r.id) })));
+      }
+    }
+    if(computeReciterIds_()>0) await saveConfig();
+  }catch(e){ /* الصيانة اختيارية؛ تُعاد المحاولة عند الدخول التالي */ }
 }
 
 /* ---------------- بدء التطبيق: الاستماع لحالة تسجيل الدخول ---------------- */
@@ -656,9 +757,10 @@ function init(){
           session = null; ready = true; render(); return;
         }
         const profile = profileSnap.data();
-        await loadAllData_(profile.role);
+        await loadAllData_(profile.role, profile.refId);
         if(profile.role==='supervisor'){
           session = { role:'supervisor', name:profile.name, id:profile.refId };
+          await supervisorMaintenance_();
         }else{
           const rAcc = DB.config.reciters.find(r=>r.id===profile.refId);
           session = { role:'reciter', name:profile.name, reciterId:profile.refId, isExaminer: !!(rAcc && rAcc.isExaminer) };
