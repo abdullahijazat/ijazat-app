@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="robots" content="noindex, nofollow, noarchive, nosnippet">
 <meta name="googlebot" content="noindex, nofollow">
-<title>شعبة إجازات القرآن الكريم — المسجد النبوي</title>
+<title>شعبة إجازات القرآن الكريم</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Amiri:wght@400;700&family=Tajawal:wght@300;400;500;700;900&display=swap');
@@ -335,7 +335,7 @@ import {
    شعبة إجازات القرآن الكريم — تطبيق إدارة الحلقات والخطط والتحضير والحصاد
    ======================================================================= */
 
-let DB = { config:{ reciters:[], circles:[], students:[], qiraahOptions:[], planTypes:[], supervisors:[] }, plans:[], attendance:[], harvest:[], examinations:[] };
+let DB = { config:{ reciters:[], circles:[], students:[], qiraahOptions:[], planTypes:[], supervisors:[] }, plans:[], attendance:[], harvest:[], examinations:[], archive:[] };
 let session = null;
 let ready = false;
 let currentTab = null;
@@ -495,7 +495,7 @@ function showToast(msg){
 // آلاف الطلاب)، نحتفظ بنسخة من آخر حالة "تمت مزامنتها بنجاح" لكل مجموعة، ونحسب فقط الفرق
 // الحقيقي (إضافة/تعديل/حذف)، ثم نكتب هذا الفرق فقط، على دفعات لا تتجاوز 450 عملية للدفعة
 // (الحد الفعلي لفايرستور هو 500 عملية في كل دفعة واحدة).
-let lastSynced = { reciters:[], circles:[], students:[], supervisors:[], plans:[], attendance:[], harvest:[], examinations:[], settings:null };
+let lastSynced = { reciters:[], circles:[], students:[], supervisors:[], plans:[], attendance:[], harvest:[], examinations:[], archive:[], settings:null };
 
 function cloneDeep_(v){ return v===undefined ? v : JSON.parse(JSON.stringify(v)); }
 
@@ -568,14 +568,65 @@ async function saveExaminations(){ const ok = await syncArrayCollection_('examin
 // الدالة باقية فقط حتى لا نحتاج لتعديل كل موضع استدعاء لها في بقية الكود.
 function saveSession(){}
 
+/* ---------------- أرشفة الطلاب عند الحذف ----------------
+   يُحفظ سجل الطالب كاملًا (بياناته، حلقاته بأسمائها، ختماته، تحضيره، خططه) في مجموعة "archive"
+   ثم يُحذف من القوائم الحية مع تحضيره وخططه. الأرشفة تُحفظ أولًا، وإن فشلت لا يُحذف شيء. */
+async function archiveAndDeleteStudents_(students, reason){
+  if(!students.length) return true;
+  const by = (session && session.name) || '';
+  const now = new Date().toISOString();
+  const entries = students.map(st=>{
+    const att = DB.attendance.filter(a=>a.studentId===st.id);
+    const pls = DB.plans.filter(p=>p.studentId===st.id);
+    const { id, ...rest } = cloneDeep_(st);
+    return {
+      id, ...rest,
+      circlesSnapshot: (st.enrollments||[]).map(en=>{ const c=getCircle(en.circleId); const r=c?getReciter(c.reciterId):null; return { circleId:en.circleId, circleName:c?c.name:'—', circleNumber:c?c.number:'', reciterName:r?r.name:'—' }; }),
+      attendanceRecords: cloneDeep_(att),
+      planRecords: cloneDeep_(pls),
+      archivedAt: now, archivedBy: by, archiveReason: reason || ''
+    };
+  });
+  const before = DB.archive.slice();
+  const newIds = new Set(entries.map(e=>e.id));
+  DB.archive = DB.archive.filter(a=>!newIds.has(a.id)).concat(entries);
+  const okArchive = await syncArrayCollection_('archive', DB.archive, 'archive');
+  if(!okArchive){ DB.archive = before; showToast('تعذّرت الأرشفة — لم يُحذف أي طالب'); return false; }
+  const ids = new Set(students.map(x=>x.id));
+  DB.config.students = DB.config.students.filter(x=>!ids.has(x.id));
+  DB.attendance = DB.attendance.filter(a=>!ids.has(a.studentId));
+  DB.plans = DB.plans.filter(p=>!ids.has(p.studentId));
+  await saveAttendance(); await savePlans();
+  return true;
+}
+
+async function restoreFromArchive_(archiveId){
+  const a = DB.archive.find(x=>x.id===archiveId);
+  if(!a) return false;
+  if(DB.config.students.some(s=>s.id===a.id)){ showToast('هذا الطالب موجود بالفعل في قائمة الطلاب'); return false; }
+  const { circlesSnapshot, attendanceRecords, planRecords, archivedAt, archivedBy, archiveReason, ...student } = cloneDeep_(a);
+  // نعيد فقط تسجيلات الحلقات التي ما زالت موجودة
+  student.enrollments = (student.enrollments||[]).filter(en=>getCircle(en.circleId));
+  DB.config.students.push(student);
+  const attIds = new Set(DB.attendance.map(x=>x.id)), plIds = new Set(DB.plans.map(x=>x.id));
+  (attendanceRecords||[]).forEach(r=>{ if(!attIds.has(r.id)) DB.attendance.push(r); });
+  (planRecords||[]).forEach(r=>{ if(!plIds.has(r.id)) DB.plans.push(r); });
+  const okC = await saveConfig(); await saveAttendance(); await savePlans();
+  if(!okC) return false;
+  DB.archive = DB.archive.filter(x=>x.id!==archiveId);
+  await syncArrayCollection_('archive', DB.archive, 'archive');
+  return true;
+}
+
 let dataFullyLoaded = false;
 
 /* ---------------- تحميل كل البيانات من Firestore بعد نجاح تسجيل الدخول ---------------- */
-async function loadAllData_(){
-  const [reciters, circles, students, supervisors, plans, attendance, harvest, examinations, settingsSnap] = await Promise.all([
+async function loadAllData_(role){
+  const [reciters, circles, students, supervisors, plans, attendance, harvest, examinations, settingsSnap, archive] = await Promise.all([
     fetchCollection_('reciters'), fetchCollection_('circles'), fetchCollection_('students'), fetchCollection_('supervisors'),
     fetchCollection_('plans'), fetchCollection_('attendance'), fetchCollection_('harvest'), fetchCollection_('examinations'),
-    getDoc(doc(fsDB,'settings','general'))
+    getDoc(doc(fsDB,'settings','general')),
+    role==='supervisor' ? fetchCollection_('archive') : Promise.resolve([])
   ]);
   const settings = settingsSnap.exists() ? settingsSnap.data() : {};
   DB.config = {
@@ -583,11 +634,11 @@ async function loadAllData_(){
     qiraahOptions: (settings.qiraahOptions && settings.qiraahOptions.length) ? settings.qiraahOptions : [...DEFAULT_QIRAAH_OPTIONS],
     planTypes: (settings.planTypes && settings.planTypes.length) ? settings.planTypes : [...DEFAULT_PLAN_TYPES],
   };
-  DB.plans = plans; DB.attendance = attendance; DB.harvest = harvest; DB.examinations = examinations;
+  DB.plans = plans; DB.attendance = attendance; DB.harvest = harvest; DB.examinations = examinations; DB.archive = archive;
 
   lastSynced = {
     reciters: cloneDeep_(reciters), circles: cloneDeep_(circles), students: cloneDeep_(students), supervisors: cloneDeep_(supervisors),
-    plans: cloneDeep_(plans), attendance: cloneDeep_(attendance), harvest: cloneDeep_(harvest), examinations: cloneDeep_(examinations),
+    plans: cloneDeep_(plans), attendance: cloneDeep_(attendance), harvest: cloneDeep_(harvest), examinations: cloneDeep_(examinations), archive: cloneDeep_(archive),
     settings: cloneDeep_({ qiraahOptions: DB.config.qiraahOptions, planTypes: DB.config.planTypes }),
   };
   dataFullyLoaded = true;
@@ -605,7 +656,7 @@ function init(){
           session = null; ready = true; render(); return;
         }
         const profile = profileSnap.data();
-        await loadAllData_();
+        await loadAllData_(profile.role);
         if(profile.role==='supervisor'){
           session = { role:'supervisor', name:profile.name, id:profile.refId };
         }else{
@@ -717,7 +768,6 @@ function renderLogin(){
   <div class="login-wrap">
     <div class="login-card">
       <div class="login-head">
-        <div class="eyebrow">المسجد النبوي الشريف</div>
         <h1>شعبة إجازات القرآن الكريم</h1>
         <p>منصّة إدارة الحلقات والخطط والتحضير والحصاد</p>
         <svg viewBox="0 0 400 40" preserveAspectRatio="none"><path d="M0,40 L0,20 Q100,0 200,20 T400,20 L400,40 Z" fill="#F6F1E4"/></svg>
@@ -791,6 +841,7 @@ function navItemsFor(role){
       ['khatmeen','الطلاب الخاتمون'],
       ['examCommittee','لجنة الاختبار'],
       ['tracking','المتابعة العامة'],
+      ['archive','الأرشيف'],
       ['change-password','تغيير كلمة المرور'],
     ];
   }
@@ -814,7 +865,6 @@ function renderShell(){
     <div class="mobile-backdrop ${mobileMenuOpen?'show':''}" id="mobileBackdrop"></div>
     <aside class="sidebar ${mobileMenuOpen?'open':''}">
       <div class="sidebar-head">
-        <div class="eyebrow">المسجد النبوي الشريف</div>
         <h2>إجازات القرآن الكريم</h2>
         <p>إدارة الحلقات والمتابعة</p>
       </div>
@@ -831,7 +881,6 @@ function renderShell(){
     </aside>
     <main class="main">
       <div class="mobile-brand-strip">
-        <div class="eyebrow">المسجد النبوي الشريف</div>
       </div>
       <div class="topbar">
         <div class="flex items-center gap8">
@@ -885,9 +934,51 @@ function renderSupervisorTab(){
     case 'khatmeen': return tplKhatmeenSupervisor();
     case 'examCommittee': return tplExamCommitteeSupervisor();
     case 'tracking': return tplTracking();
+    case 'archive': return tplArchive();
     case 'change-password': return tplChangePassword();
     default: return tplOverview();
   }
+}
+
+
+function tplArchive(){
+  const q = (uiState.archiveSearch||'').trim().toLowerCase();
+  const all = (DB.archive||[]).slice().sort((a,b)=>(b.archivedAt||'').localeCompare(a.archivedAt||''));
+  const list = !q ? all : all.filter(a=>(a.name||'').toLowerCase().includes(q) || (a.regNumber||'').toLowerCase().includes(q));
+  const fmt = iso => iso ? new Date(iso).toLocaleDateString('ar-SA-u-nu-latn') : '—';
+  return `
+  <div class="panel">
+    <div class="panel-head"><h3>أرشيف الطلاب</h3><span class="count-badge">${list.length} من ${all.length}</span></div>
+    <div class="hint" style="text-align:right;margin:0 0 14px;">هنا تُحفظ سجلات الطلاب المحذوفين (بياناتهم وحلقاتهم وختماتهم وتحضيرهم) للرجوع إليها، ويمكنك استعادة أي طالب أو حذفه نهائيًا.</div>
+    <input type="text" id="archiveSearchInput" value="${esc(uiState.archiveSearch||'')}" placeholder="ابحث بالاسم أو رقم التسجيل...">
+  </div>
+  ${!list.length ? `<div class="panel"><div class="hint" style="margin:0;">لا توجد سجلات في الأرشيف.</div></div>` : list.map(a=>{
+    const open = uiState.expandedArchive===a.id;
+    const circles = (a.circlesSnapshot||[]);
+    const khat = (a.khatmaRecords||[]);
+    return `
+    <div class="panel" style="padding:12px 16px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;">
+        <div style="text-align:right;">
+          <b>${esc(a.name)}</b>
+          ${a.regNumber?`<span class="tag tag-neutral small">رقم ${esc(a.regNumber)}</span>`:''}
+          ${a.nationality?`<span class="tag tag-neutral small">${esc(a.nationality)}</span>`:''}
+          <div class="small muted">أُرشف في ${fmt(a.archivedAt)}${a.archiveReason?' — '+esc(a.archiveReason):''}${a.archivedBy?' — بواسطة '+esc(a.archivedBy):''}</div>
+        </div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;">
+          <button class="btn btn-gold btn-sm" data-action="toggle-archive" data-id="${a.id}">${open?'إخفاء التفاصيل':'عرض التفاصيل'}</button>
+          <button class="btn btn-primary btn-sm" data-action="restore-archive" data-id="${a.id}">${uiState.confirmId==='restore:'+a.id?'تأكيد الاستعادة؟':'استعادة'}</button>
+          <button class="btn btn-danger btn-sm" data-action="del-archive" data-id="${a.id}">${uiState.confirmId==='archdel:'+a.id?'تأكيد الحذف النهائي؟':'حذف نهائي'}</button>
+        </div>
+      </div>
+      ${open ? `
+      <div style="margin-top:12px;text-align:right;">
+        <div class="small"><b>الحلقات:</b> ${circles.length ? circles.map(c=>esc((c.circleName||'—')+(c.circleNumber?' ('+c.circleNumber+')':'')+' — '+(c.reciterName||'—'))).join(' ، ') : 'لا توجد'}</div>
+        <div class="small" style="margin-top:6px;"><b>سجلات التحضير:</b> ${(a.attendanceRecords||[]).length} &nbsp; <b>الخطط:</b> ${(a.planRecords||[]).length} &nbsp; <b>الختمات:</b> ${khat.length}</div>
+        ${khat.length ? `<div class="small" style="margin-top:6px;">${khat.map(k=>esc((k.qiraah||'—')+' — '+(k.date||''))).join(' | ')}</div>` : ''}
+      </div>` : ''}
+    </div>`;
+  }).join('')}`;
 }
 
 function tplOverview(){
@@ -1356,6 +1447,10 @@ function tplImport(){
       <input type="file" data-import-file accept=".xlsx,.xls">
       ${fileName ? `<div class="hint" style="margin:6px 0 0;">الملف المختار: ${esc(fileName)}</div>` : ''}
     </div>
+    <label style="display:flex;gap:8px;align-items:flex-start;margin:12px 0;text-align:right;cursor:pointer;">
+      <input type="checkbox" data-import-sync ${uiState.importSync?'checked':''} style="margin-top:4px;">
+      <span><b>مزامنة الطلاب مع الملف:</b> يُحذف كل طالب في البرنامج ليس في ورقة "الطلاب"، ويُضاف غير الموجودين، ويبقى الموجودون بلا تغيير. (المطابقة برقم التسجيل، وإن لم يوجد فبالاسم.) سيُطلب منك تأكيد عدد المحذوفين قبل التنفيذ.</span>
+    </label>
     <button class="btn btn-primary" data-action="run-import" type="button" ${(!uiState.importFileObj || importing)?'disabled':''}>${importing?'جاري الاستيراد…':'بدء الاستيراد'}</button>
   </div>
 
@@ -1367,6 +1462,7 @@ function tplImport(){
       <div class="stat-card"><div class="num">${result.reciters}</div><div class="lbl">مقرئون أُضيفوا</div></div>
       <div class="stat-card"><div class="num">${result.circles}</div><div class="lbl">حلقات أُضيفت</div></div>
       <div class="stat-card"><div class="num">${result.students}</div><div class="lbl">طلاب أُضيفوا</div></div>
+      ${result.deletedStudents ? `<div class="stat-card"><div class="num">${result.deletedStudents}</div><div class="lbl">طلاب حُذفوا</div></div>` : ''}
     </div>
     ${result.errors.length ? `
     <div class="error-box" style="text-align:right;">
@@ -1406,9 +1502,36 @@ function findPeriodIdByName(name){
   return p ? p.id : null;
 }
 
-async function processImportFile(file){
+function normName_(x){ return (x||'').toString().replace(/\s+/g,' ').trim(); }
+
+// خطة مزامنة الطلاب: من في البرنامج وليس في ورقة "الطلاب" بالملف سيُحذف.
+// المطابقة: برقم التسجيل إن وُجد، وإلا بالاسم (للصفوف التي بلا رقم تسجيل).
+function planStudentSync_(wb){
+  const ws = wb.Sheets['الطلاب'];
+  if(!ws) return {ok:false, reason:'لا توجد ورقة باسم "الطلاب" في الملف.'};
+  const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''}).slice(1).filter(r=>r.some(c=>String(c).trim()!==''));
+  const regs = new Set(), names = new Set();
+  let valid = 0;
+  rows.forEach(r=>{
+    const name = normName_(r[0]); const reg = (r[1]||'').toString().trim();
+    if(!name) return;
+    valid++;
+    if(reg) regs.add(reg); else names.add(name);
+  });
+  if(!valid) return {ok:false, reason:'ورقة "الطلاب" في الملف فارغة — لن يُحذف أحد حمايةً للبيانات.'};
+  const toDelete = DB.config.students.filter(s=>{
+    const reg = (s.regNumber||'').toString().trim();
+    if(reg && regs.has(reg)) return false;
+    return !names.has(normName_(s.name));
+  });
+  return {ok:true, toDelete, fileCount:valid};
+}
+
+async function processImportFile(file, opts){
+  opts = opts || {};
   const buf = await file.arrayBuffer();
   const wb = XLSX.read(buf, {type:'array'});
+  let deletedStudents = 0;
   const errors = [];
   let addedReciters=0, addedCircles=0, addedStudents=0;
 
@@ -1487,16 +1610,27 @@ async function processImportFile(file){
     if(!circle){ errors.push(`الطلاب، صف ${i+2}: لم يتم إيجاد حلقة برقم "${circleNumber}"، تم التجاهل.`); return; }
     const periodId = periodName ? findPeriodIdByName(periodName) : null;
     if(periodName && !periodId){ errors.push(`الطلاب، صف ${i+2}: لم يتم التعرف على الفترة "${periodName}".`); }
-    let student = regNumber ? DB.config.students.find(s=>s.regNumber===regNumber) : null;
+    let student = regNumber ? DB.config.students.find(s=>s.regNumber===regNumber) : DB.config.students.find(s=>normName_(s.name)===normName_(name));
     if(student){
       if(!student.enrollments.some(en=>en.circleId===circle.id)){
         student.enrollments.push({circleId:circle.id, level, progress, qiraah, periodId});
+        addedStudents++;
       }
     }else{
       DB.config.students.push({id:uid(), name, regNumber, nationality, enrollments:[{circleId:circle.id, level, progress, qiraah, periodId}]});
+      addedStudents++;
     }
-    addedStudents++;
   });
+
+  // مزامنة: حذف من ليس في الملف (تُحسب الخطة من حالة البرنامج قبل الإضافة؛ الجدد لا يُحذفون أصلًا)
+  if(opts.sync){
+    const plan = planStudentSync_(wb);
+    if(plan.ok && plan.toDelete.length){
+      const okArch = await archiveAndDeleteStudents_(plan.toDelete, 'مزامنة الاستيراد من إكسل');
+      if(okArch) deletedStudents = plan.toDelete.length;
+      else errors.push('تعذّرت أرشفة الطلاب المحذوفين، لذلك لم يُحذف أحد.');
+    }else if(!plan.ok){ errors.push('تعذّرت المزامنة: '+plan.reason); }
+  }
 
   // إنشاء حساب دخول حقيقي (Firebase Authentication) لكل مقرئ جديد أُضيف في هذا الاستيراد —
   // يتطلب طلب شبكة فعلي لكل حساب، فتُنشأ الحسابات بالتتابع وليس دفعة واحدة
@@ -1509,8 +1643,8 @@ async function processImportFile(file){
   }
 
   let saved = true;
-  if(addedReciters||addedCircles||addedStudents) saved = await saveConfig();
-  return {reciters:addedReciters, circles:addedCircles, students:addedStudents, errors, saved};
+  if(addedReciters||addedCircles||addedStudents||deletedStudents) saved = await saveConfig();
+  return {reciters:addedReciters, circles:addedCircles, students:addedStudents, deletedStudents, errors, saved};
 }
 
 // استيراد الطلاب الخاتمين سابقًا من إكسل: رقم تسلسلي — الاسم — رقم التسجيل — القراءة — تاريخ الختم.
@@ -1994,7 +2128,7 @@ function printKhatmeenList(rows){
     tr:nth-child(even){background:#F6F1E4;}
     @media print{ body{padding:14mm;} }
   </style></head><body>
-  <h1>شعبة إجازات القرآن الكريم — المسجد النبوي</h1>
+  <h1>شعبة إجازات القرآن الكريم</h1>
   <p class="sub">قائمة الطلاب الخاتمين — بتاريخ ${esc(todayStr())}</p>
   <table><thead><tr><th>#</th><th>الاسم</th><th>رقم التسجيل</th><th>الجنسية</th><th>القراءة</th><th>تاريخ الختم</th></tr></thead><tbody>${rowsHtml}</tbody></table>
   </body></html>`);
@@ -2352,8 +2486,8 @@ function bindContentEvents(){
       }
       if(action==='del-all-students'){
         pendingConfirm('all-students', async ()=>{
-          DB.config.students = [];
-          await saveConfig(); showToast('تم حذف جميع الطلاب'); render();
+          if(!(await archiveAndDeleteStudents_(DB.config.students.slice(), 'حذف جميع الطلاب'))){ render(); return; }
+          await saveConfig(); showToast('تم حذف جميع الطلاب ونُقلوا إلى الأرشيف'); render();
         });
       }
       if(action==='unset-khatma'){
@@ -2395,11 +2529,31 @@ function bindContentEvents(){
       if(action==='circle-track-tab'){
         uiState.circleTrackTab = btn.dataset.track; render();
       }
+      if(action==='toggle-archive'){
+        uiState.expandedArchive = uiState.expandedArchive===btn.dataset.id ? null : btn.dataset.id; render();
+      }
+      if(action==='restore-archive'){
+        const id = btn.dataset.id;
+        pendingConfirm('restore:'+id, async ()=>{
+          const ok = await restoreFromArchive_(id);
+          if(ok) showToast('تمت استعادة الطالب مع تحضيره وخططه');
+          render();
+        });
+      }
+      if(action==='del-archive'){
+        const id = btn.dataset.id;
+        pendingConfirm('archdel:'+id, async ()=>{
+          DB.archive = DB.archive.filter(x=>x.id!==id);
+          await syncArrayCollection_('archive', DB.archive, 'archive');
+          showToast('حُذف من الأرشيف نهائيًا'); render();
+        });
+      }
       if(action==='del-student'){
         const id = btn.dataset.id;
         pendingConfirm('student:'+id, async ()=>{
-          DB.config.students = DB.config.students.filter(s=>s.id!==id);
-          await saveConfig(); showToast('تم حذف الطالب'); render();
+          const st = getStudent(id);
+          if(st && !(await archiveAndDeleteStudents_([st], 'حذف يدوي'))){ render(); return; }
+          await saveConfig(); showToast('تم حذف الطالب ونُقل إلى الأرشيف'); render();
         });
       }
       if(action==='toggle-student'){
@@ -2492,14 +2646,29 @@ function bindContentEvents(){
       }
       if(action==='run-import'){
         if(!uiState.importFileObj || uiState.importing) return;
+        let syncOpt = !!uiState.importSync;
+        if(syncOpt){
+          try{
+            const wbPrev = XLSX.read(await uiState.importFileObj.arrayBuffer(), {type:'array'});
+            const plan = planStudentSync_(wbPrev);
+            if(!plan.ok){ alert('لا يمكن المزامنة: '+plan.reason); return; }
+            const n = plan.toDelete.length;
+            const sample = plan.toDelete.slice(0,8).map(x=>'• '+x.name+(x.regNumber?' ('+x.regNumber+')':'')).join('\n');
+            if(n>0){
+              const msg = 'سيتم حذف '+n+' طالبًا من البرنامج (وبياناتهم وختماتهم) لأنهم غير موجودين في الملف، من أصل '+DB.config.students.length+'.\n\n'+sample+(n>8?'\n… وغيرهم':'')+'\n\nهل تريد المتابعة؟ لا يمكن التراجع.';
+              if(!confirm(msg)) return;
+              if(n > DB.config.students.length*0.3 && !confirm('تنبيه: الحذف يشمل أكثر من 30% من الطلاب. هل أنت متأكد أن هذا هو الملف الكامل الصحيح؟')) return;
+            }
+          }catch(err){ alert('تعذّرت قراءة الملف للمزامنة.'); return; }
+        }
         uiState.importing = true; render();
         try{
-          const result = await processImportFile(uiState.importFileObj);
+          const result = await processImportFile(uiState.importFileObj, {sync: syncOpt});
           uiState.importResult = result;
           if(result.saved===false){
             uiState.importResult.errors = ['⚠️ تم استخراج البيانات من الملف بنجاح، لكن الحفظ في قاعدة البيانات فشل — قد تختفي هذه البيانات عند تحديث الصفحة. تحقق من اتصال الإنترنت ثم أعد الاستيراد.', ...uiState.importResult.errors];
           }else{
-            showToast('اكتمل الاستيراد وحُفظ بنجاح: '+(result.reciters+result.circles+result.students)+' سجل');
+            showToast('اكتمل الاستيراد وحُفظ بنجاح: '+(result.reciters+result.circles+result.students)+' سجل'+(result.deletedStudents?(' — حُذف '+result.deletedStudents+' طالب'):''));
           }
         }catch(err){
           uiState.importResult = {reciters:0, circles:0, students:0, errors:['تعذّرت قراءة الملف. تأكد أنه بصيغة xlsx صحيحة.'], saved:true};
@@ -2582,6 +2751,8 @@ function bindContentEvents(){
       uiState.achievementPeriod = achPeriod.value;
       render(); return;
     }
+    const importSync = e.target.closest('[data-import-sync]');
+    if(importSync){ uiState.importSync = importSync.checked; render(); return; }
     const importFile = e.target.closest('[data-import-file]');
     if(importFile){
       uiState.importFileObj = importFile.files && importFile.files[0] ? importFile.files[0] : null;
@@ -2614,6 +2785,15 @@ function bindContentEvents(){
       render();
       const newInput = document.getElementById('studentSearchInput');
       if(newInput){ newInput.focus(); newInput.setSelectionRange(cursorPos, cursorPos); }
+      return;
+    }
+    const archSearch = e.target.closest('#archiveSearchInput');
+    if(archSearch){
+      uiState.archiveSearch = archSearch.value;
+      const cp = archSearch.selectionStart;
+      render();
+      const ni = document.getElementById('archiveSearchInput');
+      if(ni){ ni.focus(); ni.setSelectionRange(cp, cp); }
       return;
     }
     const khatmaSearchInput = e.target.closest('#khatmaAddSearchInput');
