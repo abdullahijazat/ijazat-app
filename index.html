@@ -2171,6 +2171,7 @@ function tplKhatmeenSupervisor(){
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;">
       <button class="btn btn-gold btn-sm" data-action="export-khatma-sup" type="button">تصدير Excel</button>
       <button class="btn btn-gold btn-sm" data-action="print-khatma-sup" type="button">طباعة / PDF</button>
+      <button class="btn btn-danger btn-sm" data-action="del-all-khatma" type="button">${uiState.confirmId==='all-khatma'?'اضغط مرة أخرى لتأكيد الحذف النهائي':'حذف جميع الخاتمين ('+rows.length+')'}</button>
     </div>
     <div style="overflow-x:auto;">
     <table><thead><tr><th>الاسم</th><th>رقم التسجيل</th><th>الجنسية</th><th>القراءة</th><th>الطريق</th><th>تاريخ الختم</th><th>المقرئ</th><th></th></tr></thead><tbody>
@@ -2856,6 +2857,17 @@ function bindContentEvents(){
           delete s.khatmaDate; delete s.khatmaCircleId;
           await saveConfig(); showToast('تمت إزالة سجل الختم'); render();
         }
+      }
+      if(action==='del-all-khatma'){
+        pendingConfirm('all-khatma', async ()=>{
+          let n=0;
+          DB.config.students.forEach(s=>{
+            if(khatmaRecordsOf(s).length || s.khatmaDate || s.khatmaCircleId){
+              s.khatmaRecords = []; delete s.khatmaDate; delete s.khatmaCircleId; n++;
+            }
+          });
+          await saveConfig(); showToast('تم حذف سجلات الختم لـ '+n+' طالب'); render();
+        });
       }
       if(action==='del-plan-record'){
         const id = btn.dataset.id;
